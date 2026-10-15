@@ -4315,4 +4315,9 @@ out.Fs = G.fs
 out.Version = G.VERSION
 out.Build = G.BUILD
 out.ScriptName = OBLITSO_CONFIG.ScriptName
-out.S
+out.ScriptVersion = OBLITSO_CONFIG.Version
+out.CleanupKey = CLEANUP_KEY
+out.Toast = Window.toast
+out.Page = G.API.Page
+return out
+end
