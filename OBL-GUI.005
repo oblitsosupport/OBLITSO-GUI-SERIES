@@ -22,6 +22,7 @@ local OBLITSO_CONFIG = {
     Version    = "Version-0000000000000000",
     Subtitle   = nil,
     AssetBase  = "https://gitlab.com/oblitso-group1/oblitso-gui/-/raw/main/assets",
+    CacheVersionURL = "https://raw.githubusercontent.com/oblitsosupport/OBLITSO-GUI-SERIES/refs/heads/main/CacheVersion",
     Log = true,
     IconAtlas = "images/icon-atlas.png",
     FontPack  = nil,
@@ -907,11 +908,16 @@ local function writeLocalCacheVersion(v)
     fs.write(CACHE_TAG, v or "")
 end
 local function fetchRemoteCacheVersion()
-    if not ASSET_BASE or ASSET_BASE == "" then return nil end
-    local url = ASSET_BASE .. "/CacheVersion"
+    local url = OBLITSO_CONFIG.CacheVersionURL
+    if not url or url == "" then return nil end
     local ok, data = pcall(function() return game:HttpGet(url) end)
-    if not ok or type(data) ~= "string" or #data < 1 then return nil end
-    return (string.gsub(data, "%s+", ""))
+    if not ok or type(data) ~= "string" then return nil end
+    local clean = (string.gsub(data, "%s+", ""))
+    -- Reject HTML, Cloudflare challenges, anything not a short version token.
+    -- On any failure return nil, which makes ensureCacheFresh() skip the purge.
+    if #clean == 0 or #clean > 16 then return nil end
+    if not string.match(clean, "^[%w_%.%-]+$") then return nil end
+    return clean
 end
 local function purgeAssetCache()
     for _, sub in ipairs({ "fonts", "images", "sounds" }) do
