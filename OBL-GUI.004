@@ -886,9 +886,8 @@ end
 do -- 03_assets.lua
 -- ============================================================================
 --  03 assets   fonts, images, sounds fetched from GitLab into local cache
---  Raw binaries for now: HttpGet returns bytes, writefile writes them, then
---  getcustomasset gives us an rbxasset:// URL to hand to Roblox. If bytes
---  corrupt in transit, switch to .b64 and decode with crypt.base64decode.
+--  Raw binaries: HttpGet returns bytes, writefile writes them, getcustomasset
+--  gives us an rbxasset:// URL to hand to Roblox.
 -- ============================================================================
 local S, fs, util = G.S, G.fs, G.util
 local Assets = { ready = false, lite = true, calls = 0, family = {}, urls = {} }
@@ -980,22 +979,22 @@ end
 -- ---------- fonts ----------
 local FAMILIES = {
     Inter = {
-        { face = "Regular",  weight = 400, style = "normal", file = "fonts/Inter-Regular.ttf" },
-        { face = "Medium",   weight = 500, style = "normal", file = "fonts/Inter-Medium.ttf" },
-        { face = "SemiBold", weight = 600, style = "normal", file = "fonts/Inter-SemiBold.ttf" },
-        { face = "Bold",     weight = 700, style = "normal", file = "fonts/Inter-Bold.ttf" },
+        { face = "Regular",  weight = "Regular",  style = "normal", file = "fonts/Inter-Regular.ttf" },
+        { face = "Medium",   weight = "Medium",   style = "normal", file = "fonts/Inter-Medium.ttf" },
+        { face = "SemiBold", weight = "SemiBold", style = "normal", file = "fonts/Inter-SemiBold.ttf" },
+        { face = "Bold",     weight = "Bold",     style = "normal", file = "fonts/Inter-Bold.ttf" },
     },
     GeistMono = {
-        { face = "Regular", weight = 400, style = "normal", file = "fonts/GeistMono-Regular.ttf" },
-        { face = "Medium",  weight = 500, style = "normal", file = "fonts/GeistMono-Medium.ttf" },
+        { face = "Regular", weight = "Regular", style = "normal", file = "fonts/GeistMono-Regular.ttf" },
+        { face = "Medium",  weight = "Medium",  style = "normal", file = "fonts/GeistMono-Medium.ttf" },
     },
     InstrumentSerif = {
-        { face = "Regular", weight = 400, style = "normal", file = "fonts/InstrumentSerif-Regular.ttf" },
-        { face = "Italic",  weight = 400, style = "italic", file = "fonts/InstrumentSerif-Italic.ttf" },
+        { face = "Regular", weight = "Regular", style = "normal", file = "fonts/InstrumentSerif-Regular.ttf" },
+        { face = "Italic",  weight = "Regular", style = "italic", file = "fonts/InstrumentSerif-Italic.ttf" },
     },
     ArchivoExpanded = {
-        { face = "Bold",  weight = 700, style = "normal", file = "fonts/Archivo-ExpandedBold.ttf" },
-        { face = "Black", weight = 900, style = "normal", file = "fonts/Archivo-ExpandedBlack.ttf" },
+        { face = "Bold",  weight = "Bold",  style = "normal", file = "fonts/Archivo-ExpandedBold.ttf" },
+        { face = "Black", weight = "Heavy", style = "normal", file = "fonts/Archivo-ExpandedBlack.ttf" },
     },
 }
 
@@ -1004,7 +1003,7 @@ local function buildFamilyJson(name, faces)
     for _, f in ipairs(faces) do
         parts[#parts + 1] = string.format(
             '{"name":"%s","weight":%d,"style":"%s","assetId":"%s"}',
-            f.face, f.weight, f.style, f.url)
+            f.face, f.weightValue or 400, f.style, f.url)
     end
     return string.format('{"name":"%s","faces":[%s]}', name, table.concat(parts, ","))
 end
@@ -1029,16 +1028,24 @@ local FALLBACK = {
 G.F = {}
 
 local KEY_MAP = {
-    text400    = { "Inter", "Regular" },
-    text500    = { "Inter", "Medium" },
-    text600    = { "Inter", "SemiBold" },
-    text700    = { "Inter", "Bold" },
-    mono400    = { "GeistMono", "Regular" },
-    mono500    = { "GeistMono", "Medium" },
-    serif      = { "InstrumentSerif", "Regular" },
-    serifItalic= { "InstrumentSerif", "Italic" },
-    wideBold   = { "ArchivoExpanded", "Bold" },
-    wideBlack  = { "ArchivoExpanded", "Black" },
+    text400    = { "Inter",           "Regular", "normal" },
+    text500    = { "Inter",           "Medium",  "normal" },
+    text600    = { "Inter",           "SemiBold","normal" },
+    text700    = { "Inter",           "Bold",    "normal" },
+    mono400    = { "GeistMono",       "Regular", "normal" },
+    mono500    = { "GeistMono",       "Medium",  "normal" },
+    serif      = { "InstrumentSerif", "Regular", "normal" },
+    serifItalic= { "InstrumentSerif", "Regular", "italic" },
+    wideBold   = { "ArchivoExpanded", "Bold",    "normal" },
+    wideBlack  = { "ArchivoExpanded", "Heavy",   "normal" },
+}
+
+local WEIGHT_VALUE = {
+    Regular  = 400,
+    Medium   = 500,
+    SemiBold = 600,
+    Bold     = 700,
+    Heavy    = 900,
 }
 
 local function loadFonts()
@@ -1049,7 +1056,12 @@ local function loadFonts()
             for _, face in ipairs(faces) do
                 local url = Assets.resolve(face.file)
                 if url then
-                    built[#built + 1] = { face = face.face, weight = face.weight, style = face.style, url = url }
+                    built[#built + 1] = {
+                        face = face.face,
+                        weightValue = WEIGHT_VALUE[face.weight] or 400,
+                        style = face.style or "normal",
+                        url = url,
+                    }
                 end
             end
             if #built > 0 then
@@ -1067,9 +1079,11 @@ local function loadFonts()
             local family = Assets.family[spec[1]]
             if family then
                 local weightName = spec[2]
-                local style = (weightName == "Italic") and Enum.FontStyle.Italic or Enum.FontStyle.Normal
-                local ok, font = pcall(Font.new, family.url,
-                    Enum.FontWeight[weightName] or Enum.FontWeight.Regular, style)
+                local styleName = spec[3]
+                local okW, weight = pcall(function() return Enum.FontWeight[weightName] end)
+                if not okW or not weight then weight = Enum.FontWeight.Regular end
+                local style = (styleName == "italic") and Enum.FontStyle.Italic or Enum.FontStyle.Normal
+                local ok, font = pcall(Font.new, family.url, weight, style)
                 if ok and font then
                     G.F[key] = font
                     custom = true
