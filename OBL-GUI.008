@@ -2815,7 +2815,34 @@ function Config.listen()
                     G.try("bind." .. id, actions[id])
                 elseif type(values[id]) == "boolean" then
                     if bind.mode == "hold" then Config.set(id, true)
-                    else Config.set(id, not values[id]) enddo -- 06_controls.lua
+                    else Config.set(id, not values[id]) end
+                end
+            end
+        end
+    end, "keybinds")
+    G.connect(UIS.InputEnded, function(input)
+        if Config.capturing then return end
+        if Config.captureDoneAt > 0 and os.clock() - Config.captureDoneAt < 0.08 then return end
+        local key = keyName(input)
+        local list = key and byKey[key]
+        if not list then return end
+        for _, id in ipairs(list) do
+            local bind = binds[id]
+            if bind and bind.mode == "hold" and type(values[id]) == "boolean" and not actions[id] then
+                Config.set(id, false)
+            end
+        end
+    end, "keybinds")
+end
+function Config.keyDown(key)
+    if not key or key == "None" then return false end
+    if key == "MouseButton2" then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
+    if key == "MouseButton3" then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton3) end
+    local ok, code = pcall(function() return Enum.KeyCode[key] end)
+    return ok and code ~= nil and UIS:IsKeyDown(code)
+end
+end
+do -- 06_controls.lua
 -- ============================================================================
 --  06 controls  rows, right-click menu, danger flags
 -- ============================================================================
@@ -5056,29 +5083,242 @@ local function buildProfileSection(page)
     end })
     profile:Button({ label = "Copy profile link", text = "Copy link", bindable = false, run = function()
         G.clipboard("https://www.roblox.com/users/" .. tostring(G.LP.UserId) .. "/profile")
-        Window.toast({ title = "Copied", text = "Profile link",
+        Window.toast({ title = "Copied", text = "Profile link", icon = "clipboard", tone = "ok" })
+    end })
+end
+
+local function buildSettings()
+    Window.page({
+        id = "settings", title = "Settings", icon = "settings", group = "Framework", order = 99999,
+        eyebrow = "Make it yours",
+        build = function(page)
+            local look = page:Section({ title = "Appearance", icon = "palette", desc = "Changes apply live." })
+            look:Segmented({ id = "app.scheme", label = "Scheme",
+                options = { { "oblitos", "Oblitso" }, { "graphite", "Graphite" }, { "midnight", "Midnight" }, { "porcelain", "Porcelain" } },
+                width = 300 })
+            look:Custom({ height = 46, name = "Accent", build = function(frame)
+                local row = UI.frame(frame, { Size = UDim2.new(1, -28, 0, 30), Position = UDim2.fromOffset(14, 8) })
+                UI.list(row, "x", 9, { v = "Center" })
+                local rings = {}
+                local function mark()
+                    local current = Config.get("app.accent")
+                    for color, ring in pairs(rings) do
+                        Motion.to(ring, "Transparency", util.toHex(color) == util.toHex(current) and 0 or 1, "quick")
+                    end
+                end
+                for index, accent in ipairs(Theme.accents) do
+                    local swatch = UI.frame(row, { Size = UDim2.fromOffset(24, 24), BackgroundColor3 = accent.color, LayoutOrder = index })
+                    UI.corner(swatch, true)
+                    local ring = Instance.new("UIStroke")
+                    ring.Thickness = 2
+                    ring.Transparency = 1
+                    pcall(function() ring.BorderStrokePosition = Enum.BorderStrokePosition.Outer end)
+                    pcall(function() ring.BorderOffset = UDim.new(0, 2) end)
+                    Theme.bind(ring, "Color", "ink")
+                    ring.Parent = swatch
+                    rings[accent.color] = ring
+                    local scale = UI.scaleOf(swatch)
+                    local hit = UI.button(swatch, {
+                        hover = function(on) Motion.to(scale, "Scale", on and 1.12 or 1, "snappy") end,
+                        click = function() Config.set("app.accent", accent.color) end,
+                    })
+                    UI.tooltip(hit, accent.label)
+                end
+                local custom = UI.frame(row, { Size = UDim2.fromOffset(24, 24), LayoutOrder = 99,
+                    Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" } })
+                UI.corner(custom, true)
+                UI.icon(custom, "pipette", 13, "sub", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+                UI.button(custom, { click = function()
+                    Controls.colorPopover(custom, Config.get("app.accent"), function(color) Config.set("app.accent", color) end)
+                end })
+                Config.on("app.accent", function() if row.Parent then mark() end end)
+                mark()
+            end })
+            look:Slider({ id = "app.glass", label = "Glass", desc = "Clear on the left, tinted on the right.", min = 0, max = 100, step = 1, suffix = "%" })
+            look:Slider({ id = "app.radius", label = "Corner roundness", min = 40, max = 130, step = 5, suffix = "%" })
+            look:Slider({ id = "app.scale", label = "Interface size", desc = "It never grows past the screen.", min = 60, max = 160, step = 5, suffix = "%" })
+            look:Segmented({ id = "app.scrollbar", label = "Scrollbar", options = { { "always", "Always" }, { "auto", "Scrolling" }, { "off", "Off" } }, width = 232 })
+
+            local motion = page:Section({ title = "Motion", icon = "activity" })
+            motion:Segmented({ id = "app.motion", label = "Animations", options = { { "full", "Full" }, { "reduced", "Reduced" } }, width = 170 })
+            motion:Slider({ id = "app.motionSpeed", label = "Animation speed", min = 40, max = 250, step = 10, suffix = "%" })
+
+            local sound = page:Section({ title = "Sound", icon = "volume-2" })
+            sound:Toggle({ id = "app.sfx", label = "Sound effects", bindable = false,
+                desc = "Clicks, hover ticks, toggle thuds. Pulled from bh_*.ogg." })
+            sound:Slider({ id = "app.sfxVolume", label = "Volume", min = 0, max = 100, step = 5, suffix = "%" })
+
+            buildSafetySection(page)
+
+            local keys = page:Section({ title = "Keys", icon = "keyboard" })
+            keys:Keybind({ id = "app.key.menu", label = "Open / close the window" })
+            keys:Keybind({ id = "app.key.panic", label = "Panic", desc = "Unloads the script instantly." })
+            keys:Toggle({ id = "app.freeCursor", label = "Free the cursor while open", desc = "Unlocks the mouse in first-person games.", bindable = false })
+            keys:Note({ icon = "info", text = "Right-click any toggle or button to bind it or flag it as dangerous." })
+
+            local screen = page:Section({ title = "On screen", icon = "monitor" })
+            screen:Toggle({ id = "app.toasts", label = "Show toasts", bindable = false })
+
+            local about = page:Section({ title = "About", icon = "info" })
+            local function stat(label, value)
+                about:Custom({ height = 34, build = function(frame)
+                    UI.text(frame, label, "label", "sub", { Position = UDim2.new(0, 14, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5), TextSize = 13 })
+                    local text = UI.text(frame, "", "mono", "ink", { Position = UDim2.new(1, -14, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5) })
+                    if type(value) == "function" then
+                        text.Text = tostring(value())
+                        Motion.every(function()
+                            if text.Parent and Window.open and Window.current and Window.current.id == "settings" then
+                                text.Text = tostring(value())
+                            end
+                        end, 2, "about")
+                    else text.Text = tostring(value) end
+                end })
             end
-        end
-    end, "keybinds")
-    G.connect(UIS.InputEnded, function(input)
+            stat("Loader", G.VERSION .. "  /  " .. G.BUILD)
+            stat("Script", OBLITSO_CONFIG.ScriptName)
+            stat("Version", OBLITSO_CONFIG.Version)
+            stat("Executor", G.executor)
+            stat("Fonts", function() return G.Assets.fontSource == "custom" and "custom pack" or "built-in fallback" end)
+            stat("Faults", function() return #G.faults end)
+            about:Button({ label = "Copy diagnostics", text = "Copy", bindable = false, run = function()
+                local lines = {
+                    "OBLITSO GUI " .. G.VERSION .. " " .. G.BUILD,
+                    "script " .. OBLITSO_CONFIG.ScriptName .. " " .. OBLITSO_CONFIG.Version,
+                    "executor " .. G.executor,
+                    "place " .. game.PlaceId .. " universe " .. game.GameId,
+                }
+                for _, fault in ipairs(G.faults) do
+                    lines[#lines + 1] = string.format("[%.1fs] %s: %s", fault.at, fault.scope, fault.message)
+                end
+                G.clipboard(table.concat(lines, "\n"))
+                Window.toast({ title = "Diagnostics copied", icon = "clipboard", tone = "ok" })
+            end })
+            about:Button({ label = "Unload", text = "Unload", style = "danger", bindable = false, run = function() G.unload() end })
+            about:Note({ text = "OBLITSO GUI is standalone. Every setting lives under " .. OBLITSO_CONFIG.SaveFolder .. "/ in the executor's workspace." })
+
+            buildProfileSection(page)
+        end,
+    })
+end
+
+local function boot()
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    local started = os.clock()
+
+    Config.init()
+    Assets.init()
+    applyPrefs()
+    Window.build()
+    buildHome()
+    buildSettings()
+    Window.rebuildNav()
+    Config.listen()
+
+    G.connect(S.UserInputService.InputBegan, function(input)
         if Config.capturing then return end
-        if Config.captureDoneAt > 0 and os.clock() - Config.captureDoneAt < 0.08 then return end
-        local key = keyName(input)
-        local list = key and byKey[key]
-        if not list then return end
-        for _, id in ipairs(list) do
-            local bind = binds[id]
-            if bind and bind.mode == "hold" and type(values[id]) == "boolean" and not actions[id] then
-                Config.set(id, false)
-            end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if S.UserInputService:GetFocusedTextBox() then return end
+        local name = input.KeyCode.Name
+        if name == Config.get("app.key.menu") then
+            Window.toggle()
+        elseif name == Config.get("app.key.panic") then
+            G.unload()
+        elseif name == (OBLITSO_CONFIG.SearchKey or "K")
+            and (S.UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+              or S.UserInputService:IsKeyDown(Enum.KeyCode.RightControl))
+            and Window.open then
+            Window.palette()
         end
-    end, "keybinds")
+    end, "boot.keys")
+
+    Window.show(true)
+    task.delay(0.7, function() if G.alive then Window.prebuild() end end)
+    G.bootMs = math.floor((os.clock() - G.bootClock) * 1000)
+
+    task.delay(0.9, function()
+        if not G.alive then return end
+        local profiles = Config.listProfiles()
+        local autoload = Config.getAutoload()
+        if #profiles > 0 and autoload == "" then
+            Window.toast({
+                title = "Saved configs found",
+                text = tostring(#profiles) .. " config(s) on disk. Open Settings to load one.",
+                icon = "save",
+                tone = "accent",
+                time = 6,
+            })
+        end
+        local skipped = Config.skippedDangerous or {}
+        if #skipped > 0 then
+            local names = {}
+            for i, id in ipairs(skipped) do
+                local spec = G.Controls.specs[id]
+                names[#names + 1] = spec and spec.label or id
+            end
+            local joined = table.concat(names, ", ")
+            local verb = #skipped == 1 and "is" or "are"
+            Window.toast({
+                title = "Ban risk warning",
+                text = joined .. " " .. verb .. " saved as On but have ban risks. Enable manually if you accept the risk.",
+                icon = "triangle-alert",
+                tone = "bad",
+                time = 12,
+            })
+        end
+    end)
+
+    if OBLITSO_CONFIG.Announce then
+        print("[OBLITSO " .. OBLITSO_CONFIG.ScriptName .. "] Loaded " .. OBLITSO_CONFIG.Version)
+    end
+    if OBLITSO_CONFIG.Log and OBLITSO_CONFIG.__dispatch then
+        OBLITSO_CONFIG.__dispatch(OBLITSO_CONFIG.ScriptName, OBLITSO_CONFIG.Version)
+    end
+
+    local elapsed = os.clock() - started
+    local wait_left = math.max(0, 3.0 - elapsed)
+    if wait_left > 0 then task.wait(wait_left) end
 end
-function Config.keyDown(key)
-    if not key or key == "None" then return false end
-    if key == "MouseButton2" then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
-    if key == "MouseButton3" then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton3) end
-    local ok, code = pcall(function() return Enum.KeyCode[key] end)
-    return ok and code ~= nil and UIS:IsKeyDown(code)
+
+task.spawn(function()
+    if G.splashShow then G.splashShow() end
+    task.wait(0.5)
+    local ok, err = xpcall(boot, function(e) return tostring(e) .. "\n" .. debug.traceback("", 2) end)
+    if not ok then G.fault("boot", err) end
+    if G.splashKill then G.splashKill() else if G.splashHide then G.splashHide(true) end end
+end)
+
+local function keyFor(name)
+    return "_G.__OBLITSO_" .. (string.gsub(tostring(name or "script"), "%W", "_")) .. "_CLEANUP"
 end
+local CLEANUP_KEY = keyFor(OBLITSO_CONFIG.ScriptName)
+
+local existing = G.genv[CLEANUP_KEY]
+if type(existing) == "function" then
+    pcall(existing)
+end
+
+local function cleanup()
+    if G.genv[CLEANUP_KEY] == cleanup then G.genv[CLEANUP_KEY] = nil end
+    G.unload()
+end
+G.genv[CLEANUP_KEY] = cleanup
+
+local out = setmetatable({}, { __index = G.API })
+out.Rayfield = function(self) return G.getRayfield() end
+out.Config = Config
+out.Window = Window
+out.Theme = Theme
+out.Motion = Motion
+out.UI = UI
+out.Controls = Controls
+out.Util = G.util
+out.Fs = G.fs
+out.Version = G.VERSION
+out.Build = G.BUILD
+out.ScriptName = OBLITSO_CONFIG.ScriptName
+out.ScriptVersion = OBLITSO_CONFIG.Version
+out.CleanupKey = CLEANUP_KEY
+out.Toast = Window.toast
+out.Page = G.API.Page
+return out
 end
