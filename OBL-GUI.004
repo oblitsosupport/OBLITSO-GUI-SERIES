@@ -3182,3 +3182,1587 @@ function Controls.custom(section, spec)
     return frame
 end
 end
+do -- 07_window.lua
+-- ============================================================================
+--  07 window   the shell: glass, sidebar (wordmark), pages, cards, toasts,
+--               palette, safety section, boot warnings
+-- ============================================================================
+local S, util, Motion, Theme, T, UI, Config, Controls, Assets = G.S, G.util, G.Motion, G.Theme, G.T, G.UI, G.Config, G.Controls, G.Assets
+local UIS = S.UserInputService
+local Window = { open = false, built = false, pages = {}, order = {}, index = {}, scale = 1,
+    onShow = G.Signal.new(), onPage = G.Signal.new() }
+G.Window = Window
+
+local W, H = 980, 624
+local SIDE = 206
+local CONTENT_X = SIDE + 20
+local CONTENT_W = W - CONTENT_X - 10
+local HEADER = 84
+
+local toasts = {}
+local function layoutToasts()
+    local y = 0
+    for _, toast in ipairs(toasts) do
+        Motion.to(toast.holder, "Position", UDim2.new(1, -18, 0, 18 + y), "smooth")
+        y += toast.height + 10
+    end
+end
+
+-- Toast labels use legacy Enum.Font (not FontFace) because some executors
+-- silently blank FontFace-backed labels. Colours and transparency are set
+-- directly, not bound, so nothing can un-set them mid-animation.
+function Window.toast(opts)
+    if not Window.hud or not Config.get("app.toasts") then return end
+    local tone = opts.tone or "accent"
+    local title = opts.title or ""
+    local body = opts.text
+    local hasBody = body ~= nil and body ~= ""
+    local toast = { height = hasBody and 64 or 48 }
+    UI.sfx("notify", 0.55)
+    local holder = UI.frame(Window.hud, { Name = "Toast", AnchorPoint = Vector2.new(1, 0),
+        Size = UDim2.fromOffset(324, toast.height), Position = UDim2.new(1, 360, 0, 18) })
+    local sizer = Instance.new("UIScale"); sizer.Scale = Window.scale; sizer.Parent = holder
+    local glass = UI.glass(holder, { level = "popover", radius = "rCard", shadow = 30, shadowY = 12,
+        props = { Size = UDim2.fromScale(1, 1) } })
+    local chip = UI.frame(glass, { Size = UDim2.fromOffset(30, 30), Position = UDim2.new(0, 10, 0.5, 0),
+        AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = T[tone] or tone, BackgroundTransparency = 0.84, ZIndex = 3 })
+    UI.corner(chip, 9)
+    UI.icon(chip, opts.icon or "sparkles", 16, T[tone] or tone,
+        { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), ZIndex = 4 })
+
+    local titleY = hasBody and 11 or 15
+    UI.new("TextLabel", {
+        Name = "Title", BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(50, titleY), Size = UDim2.new(1, -64, 0, 18),
+        Font = Enum.Font.GothamBold, TextSize = 14, Text = title,
+        TextColor3 = Color3.fromRGB(245, 244, 239), TextTransparency = 0,
+        TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+        TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3, Parent = glass })
+
+    if hasBody then
+        UI.new("TextLabel", {
+            Name = "Body", BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(50, 31), Size = UDim2.new(1, -64, 0, 17),
+            Font = Enum.Font.Gotham, TextSize = 12, Text = body,
+            TextColor3 = Color3.fromRGB(168, 167, 180), TextTransparency = 0,
+            TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+            TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3, Parent = glass })
+    end
+
+    local timer = UI.frame(glass, { Size = UDim2.new(1, -28, 0, 2), Position = UDim2.new(0, 14, 1, -5),
+        BackgroundColor3 = T[tone] or tone, BackgroundTransparency = 0.45, ZIndex = 3 })
+    UI.corner(timer, true)
+    toast.holder = holder
+    table.insert(toasts, 1, toast)
+    while #toasts > 4 do
+        local old = table.remove(toasts)
+        old.holder:Destroy()
+    end
+    layoutToasts()
+    local life = opts.time or 3.6
+    Motion.tween(life, Motion.ease.linear, function(p) timer.Size = UDim2.new(1 - p, -28 * (1 - p), 0, 2) end)
+    local function dismiss()
+        if toast.gone then return end
+        toast.gone = true
+        local at = table.find(toasts, toast)
+        if at then table.remove(toasts, at) end
+        Motion.to(holder, "Position", UDim2.new(1, 380, 0, holder.Position.Y.Offset), "smooth", function() holder:Destroy() end)
+        layoutToasts()
+    end
+    task.delay(life, function() if G.alive then dismiss() end end)
+    UI.button(glass, { click = dismiss })
+    return dismiss
+end
+
+local SectionApi = {}
+SectionApi.__index = SectionApi
+for _, kind in ipairs({ "toggle", "slider", "dropdown", "multi", "segmented", "color", "keybind", "button", "input", "note", "custom" }) do
+    SectionApi[kind] = function(self, spec) return Controls[kind](self.raw, spec) end
+end
+for _, kind in ipairs({ "toggle", "slider", "dropdown", "multi", "segmented", "color", "keybind", "button", "input", "note", "custom" }) do
+    local cap = string.upper(string.sub(kind, 1, 1)) .. string.sub(kind, 2)
+    SectionApi[cap] = SectionApi[kind]
+end
+function Window.sectionApi(raw) return setmetatable({ raw = raw, body = raw.body }, SectionApi) end
+
+local Page = {}
+Page.__index = Page
+local function band(page, full)
+    page.bandCount += 1
+    local frame = UI.frame(page.content, { Name = full and "Full" or "Columns", Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = page.bandCount })
+    if full then
+        UI.list(frame, "y", 12)
+        return { full = true, frame = frame }
+    end
+    local columns = {}
+    for i = 1, 2 do
+        local column = UI.frame(frame, { Name = "Column" .. i, Size = UDim2.new(0.5, -6, 0, 0),
+            Position = UDim2.new(i == 1 and 0 or 0.5, i == 1 and 0 or 6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
+        UI.list(column, "y", 12)
+        columns[i] = { frame = column, count = 0 }
+    end
+    return { full = false, frame = frame, columns = columns }
+end
+function Page:section(spec)
+    spec = spec or {}
+    if self.slicing then task.wait() end
+    local current = self.band
+    if spec.full then
+        current = band(self, true)
+        self.band = nil
+    elseif not current or current.full then
+        current = band(self, false)
+        self.band = current
+    end
+    local host
+    if current.full then host = current.frame else
+        local column = spec.column and current.columns[spec.column]
+            or (current.columns[1].count <= current.columns[2].count and current.columns[1] or current.columns[2])
+        column.count += spec.weight or 1
+        host = column.frame
+    end
+    self.sectionCount += 1
+    local card = UI.surface(host, { Name = spec.title or "Card", Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = self.sectionCount })
+    UI.stroke(card, "ink", "strokeA")
+    local stack = UI.frame(card, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
+    UI.list(stack, "y", 0)
+    UI.pad(stack, 0, 0, 4, 0)
+    if spec.title then
+        local head = UI.frame(stack, { Name = "Head", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 0 })
+        UI.pad(head, 14, 14, 8, 14)
+        UI.list(head, "y", 3)
+        local line = UI.frame(head, { Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 1 })
+        UI.list(line, "x", 8, { v = "Center" })
+        if spec.icon then UI.icon(line, spec.icon, 16, "accent", { LayoutOrder = 1 }) end
+        UI.text(line, spec.title, "heading", "ink", { LayoutOrder = 2 })
+        if spec.badge then UI.badge(line, spec.badge, spec.badgeColor, { LayoutOrder = 3 }) end
+        if spec.desc then
+            UI.text(head, spec.desc, "caption", "sub", { TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+                Size = UDim2.new(1, 0, 0, 0), LayoutOrder = 2, LineHeight = 1.15 })
+        end
+    end
+    local body = UI.frame(stack, { Name = "Body", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1 })
+    UI.list(body, "y", 0)
+    local page = self
+    local raw = { body = body, count = spec.title and 1 or 0, page = self, card = card }
+    function raw.index(entry)
+        entry.page, entry.section = page, spec.title or page.title
+        Window.index[#Window.index + 1] = entry
+    end
+    local api = Window.sectionApi(raw)
+    api.card = card
+    return api
+end
+function Page:custom(height, build)
+    if self.slicing then task.wait() end
+    local current = band(self, true)
+    self.band = nil
+    local frame = UI.frame(current.frame, { Name = "Custom", Size = UDim2.new(1, 0, 0, height or 0) })
+    if not height then frame.AutomaticSize = Enum.AutomaticSize.Y end
+    G.try("page.custom", build, frame)
+    return frame
+end
+function Page:empty(icon, title, text)
+    return self:custom(380, function(frame)
+        local box = UI.frame(frame, { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.46),
+            Size = UDim2.fromOffset(420, 0), AutomaticSize = Enum.AutomaticSize.Y })
+        UI.list(box, "y", 10, { h = "Center" })
+        local orb = UI.frame(box, { Size = UDim2.fromOffset(64, 64),
+            Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" }, LayoutOrder = 1 })
+        UI.corner(orb, true)
+        UI.stroke(orb, "ink", "strokeA")
+        UI.icon(orb, icon or "package", 26, "sub", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+        UI.text(box, title or "Nothing here yet", "title", "ink", { LayoutOrder = 2, TextXAlignment = Enum.TextXAlignment.Center })
+        UI.text(box, text or "", "body", "sub", { LayoutOrder = 3, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Center,
+            Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LineHeight = 1.25 })
+    end)
+end
+Page.Section = Page.section
+Page.Custom  = Page.custom
+Page.Empty   = Page.empty
+
+function Window.page(spec)
+    local order = spec.order or (100 + (#Window.order + 1) * 10)
+    local page = setmetatable({ id = spec.id, title = spec.title, icon = spec.icon or "circle",
+        group = spec.group or "", eyebrow = spec.eyebrow, build = spec.build, built = false,
+        bandCount = 0, sectionCount = 0, order = order }, Page)
+    Window.pages[spec.id] = page
+    Window.order[#Window.order + 1] = page
+    table.sort(Window.order, function(a, b) return a.order < b.order end)
+    if Window.built then Window.rebuildNav() end
+    return page
+end
+function Window.removePage(id)
+    local page = Window.pages[id]
+    if not page then return end
+    Window.pages[id] = nil
+    table.remove(Window.order, table.find(Window.order, page))
+    if page.frame then page.holder:Destroy() end
+    for index = #Window.index, 1, -1 do
+        if Window.index[index].page == page then table.remove(Window.index, index) end
+    end
+    if Window.built then Window.rebuildNav() end
+end
+local function ensureBuilt(page, background)
+    if page.built then return end
+    page.built = true
+    page.slicing = background == true
+    local holder = UI.group(Window.pageHost, { Name = page.id, Size = UDim2.fromScale(1, 1), Visible = false })
+    local scroller, api = UI.scroll(holder, { Size = UDim2.new(1, 0, 1, 0), Name = "Scroll" })
+    local content = UI.frame(scroller, { Name = "Content", Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
+    UI.list(content, "y", 12)
+    UI.pad(content, 2, 0, 18, 0)
+    page.holder, page.frame, page.scroll, page.content = holder, scroller, api, content
+    local started = os.clock()
+    if page.build then G.try("page." .. page.id, page.build, page) end
+    if page.sectionCount == 0 and page.bandCount == 0 then
+        page:empty("package", "Nothing here yet", "This tab is ready for its controls.")
+    end
+    page.slicing = false
+    page.ready = true
+    page.buildMs = (os.clock() - started) * 1000
+end
+function Window.prebuild()
+    if Window.prebuilding then return end
+    Window.prebuilding = true
+    for _, page in ipairs(table.clone(Window.order)) do
+        if not G.alive then return end
+        if Window.pages[page.id] == page and not page.built then
+            G.try("page.prebuild", ensureBuilt, page, true)
+            task.wait(0.05)
+        end
+    end
+    Window.prebuilding = false
+end
+Window.ensureBuilt = ensureBuilt
+
+function Window.go(id, instant)
+    local page = Window.pages[id]
+    if not page or not Window.built then return end
+    local previous = Window.current
+    if previous == page then return end
+    ensureBuilt(page)
+    Window.current = page
+    UI.closePopovers()
+    UI.hideTip()
+    if previous and previous.holder then
+        local old = previous.holder
+        UI.fade(old, 0, "quick")
+        Motion.to(old, "Position", UDim2.fromOffset(0, -8), "quick")
+    end
+    page.holder.Visible = true
+    if instant then
+        UI.setFade(page.holder, 1)
+        page.holder.Position = UDim2.new()
+    else
+        UI.setFade(page.holder, 0)
+        Motion.snap(page.holder, "Position", UDim2.fromOffset(0, 14))
+        UI.fade(page.holder, 1, "smooth")
+        Motion.to(page.holder, "Position", UDim2.new(), "smooth")
+    end
+    Window.setTitle(page, instant)
+    Window.selectNav(page, instant)
+    Window.onPage:fire(page)
+    if not instant then UI.sfx("tab", 0.6) end
+end
+
+local navItems = {}
+function Window.build()
+    if Window.built then return end
+    Window.built = true
+    local gui = G.screen(9000, "OBLITSO_GUI_" .. util.randomName())
+    local hudGui = G.screen(9100, "OBLITSO_HUD_" .. util.randomName())
+    Window.gui, Window.hudGui = gui, hudGui
+    Window.hud = UI.frame(hudGui, { Name = "Hud", Size = UDim2.fromScale(1, 1) })
+    UI.soundHost = UI.frame(hudGui, { Name = "Sound" })
+    Window.modal = UI.new("TextButton", {
+        Name = "Modal", Text = "", BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(-9999, -9999), Size = UDim2.fromOffset(1, 1),
+        Modal = false, Visible = false, Active = false, Selectable = false,
+        ZIndex = -100, Parent = gui })
+    local stage = UI.frame(gui, { Name = "Stage", Size = UDim2.fromScale(1, 1) })
+    local holder = UI.frame(stage, { Name = "Window", Size = UDim2.fromOffset(W, H), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5), Visible = false })
+    local sizer = Instance.new("UIScale")
+    sizer.Parent = holder
+    Window.holder, Window.sizer = holder, sizer
+    UI.unit = function() return sizer.Scale end
+    local shadowHost = UI.frame(holder, { Name = "Shadow", Size = UDim2.fromScale(1, 1) })
+    UI.corner(shadowHost, "rWindow")
+    if UI.fx.shadow then
+        local shadow = Instance.new("UIShadow")
+        shadow.BlurRadius = UDim.new(0, 70)
+        shadow.Offset = UDim2.fromOffset(0, 28)
+        shadow.Color = Color3.new(0, 0, 0)
+        shadow.Transparency = 1
+        pcall(function() shadow.ShowBehindParent = false end)
+        shadow.Parent = shadowHost
+        Window.shadow = shadow
+    end
+    local root = UI.group(holder, { Name = "Root", Size = UDim2.fromScale(1, 1) })
+    UI.corner(root, "rWindow")
+    Window.root = root
+    local glass, rim = UI.glass(root, { level = "window", radius = "rWindow", name = "Glass",
+        props = { Size = UDim2.fromScale(1, 1), Active = true }, rimHi = 0.42, rimLo = 0.7, sheenAlpha = 0.95 })
+    Window.glass, Window.rim = glass, rim
+    local side = UI.glass(glass, { level = "panel", radius = "rPanel", name = "Sidebar", fill = "fill1A",
+        props = { Size = UDim2.new(0, SIDE, 1, -20), Position = UDim2.fromOffset(10, 10) }, rimHi = 0.72, rimLo = 0.9 })
+    Window.side = side
+    local brand = UI.frame(side, { Name = "Brand", Size = UDim2.new(1, 0, 0, 58) })
+    if Assets.urls.wordmark then
+        UI.new("ImageLabel", {
+            Name = "Logo", BackgroundTransparency = 1, BorderSizePixel = 0,
+            Position = UDim2.fromOffset(18, 16),
+            Size = UDim2.fromOffset(120, 26),
+            Image = Assets.urls.wordmark,
+            ImageColor3 = Color3.new(1, 1, 1),
+            ScaleType = Enum.ScaleType.Fit,
+            Parent = brand,
+        })
+    else
+        local mark = UI.frame(brand, { Size = UDim2.fromOffset(0, 26), Position = UDim2.fromOffset(18, 18), AutomaticSize = Enum.AutomaticSize.X })
+        UI.list(mark, "x", 3, { v = "Bottom" })
+        UI.text(mark, "OBLITSO", "brand", "ink", { LayoutOrder = 1, TextSize = 17 })
+        UI.text(mark, "gui", "display", "accent", { LayoutOrder = 2, TextSize = 21 })
+    end
+    Window.navHost = UI.frame(side, { Name = "Nav", Size = UDim2.new(1, -16, 1, -128), Position = UDim2.fromOffset(8, 60) })
+    Window.navPill = UI.frame(Window.navHost, { Name = "Pill", Size = UDim2.new(1, 0, 0, 34),
+        Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" }, Visible = false })
+    UI.corner(Window.navPill, "rControl")
+    UI.stroke(Window.navPill, "ink", "strokeA")
+    local user = UI.frame(side, { Name = "User", Size = UDim2.new(1, -16, 0, 50), Position = UDim2.new(0, 8, 1, -58),
+        Theme = { BackgroundColor3 = "ink" }, BackgroundTransparency = 1 })
+    UI.corner(user, "rControl")
+    local avatar = UI.new("ImageLabel", { Name = "Avatar", Size = UDim2.fromOffset(32, 32), Position = UDim2.new(0, 9, 0.5, 0),
+        AnchorPoint = Vector2.new(0, 0.5), Theme = { BackgroundColor3 = "ink" },
+        Image = "rbxthumb://type=AvatarHeadShot&id=" .. tostring(G.LP.UserId) .. "&w=150&h=150", Parent = user })
+    avatar.BackgroundTransparency = 0.9
+    UI.corner(avatar, true)
+    UI.text(user, G.LP.DisplayName, "label", "ink", { Position = UDim2.fromOffset(50, 9), Size = UDim2.new(1, -78, 0, 17),
+        AutomaticSize = Enum.AutomaticSize.None, TextTruncate = Enum.TextTruncate.AtEnd, TextSize = 13 })
+    Window.userLine = UI.text(user, "@" .. G.LP.Name, "caption", "faint", { Position = UDim2.fromOffset(50, 26),
+        Size = UDim2.new(1, -78, 0, 15), AutomaticSize = Enum.AutomaticSize.None, TextTruncate = Enum.TextTruncate.AtEnd, TextSize = 11 })
+    local more = UI.icon(user, "ellipsis", 16, "faint", { Position = UDim2.new(1, -12, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5) })
+    UI.button(user, {
+        hover = function(on) Motion.to(user, "BackgroundTransparency", on and T.fill2A or 1, "quick") end,
+        click = function()
+            UI.menu(more, {
+                { label = "Settings", icon = "settings", run = function() Window.go("settings") end },
+                { label = "Search", icon = "search", hint = "Ctrl K", run = function() Window.palette() end },
+                "divider",
+                { label = "Hide window", icon = "eye-off", hint = Config.keyLabel(Config.get("app.key.menu")),
+                    run = function() Window.show(false) end },
+                { label = "Unload " .. OBLITSO_CONFIG.ScriptName, icon = "power", danger = true, run = function() G.unload() end },
+            }, { side = "above", align = "left", width = 214 })
+        end,
+    })
+    local header = UI.frame(glass, { Name = "Header", Size = UDim2.new(0, CONTENT_W, 0, HEADER), Position = UDim2.fromOffset(CONTENT_X, 6) })
+    Window.header = header
+    Window.eyebrow = UI.text(header, "", "eyebrow", "faint", { Position = UDim2.fromOffset(2, 13) })
+    local titleClip = UI.frame(header, { Name = "TitleClip", Size = UDim2.new(1, -250, 0, 46), Position = UDim2.fromOffset(0, 27),
+        ClipsDescendants = true })
+    Window.titleClip = titleClip
+    local search = UI.frame(header, { Name = "Search", Size = UDim2.fromOffset(170, 32), AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -78, 0, 22), Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill1A" } })
+    UI.corner(search, true)
+    UI.stroke(search, "ink", "strokeA")
+    UI.icon(search, "search", 15, "faint", { Position = UDim2.new(0, 12, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5) })
+    UI.text(search, "Search", "body", "faint", { Position = UDim2.new(0, 34, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5) })
+    local hint = UI.frame(search, { Size = UDim2.fromOffset(0, 18), AutomaticSize = Enum.AutomaticSize.X,
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+        Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" } })
+    UI.corner(hint, 6); UI.pad(hint, 0, 6)
+    UI.text(hint, "Ctrl " .. string.upper(tostring(OBLITSO_CONFIG.SearchKey or "K")), "mono", "faint",
+        { TextSize = 10.5, Size = UDim2.fromScale(0, 1), AutomaticSize = Enum.AutomaticSize.X })
+    UI.button(search, {
+        hover = function(on) Motion.to(search, "BackgroundTransparency", on and T.fill2A or T.fill1A, "quick") end,
+        click = function() Window.palette() end,
+    })
+    local function roundButton(icon, x, tone, run, tip)
+        local button = UI.frame(header, { Size = UDim2.fromOffset(30, 30), AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, x, 0, 23), Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill1A" } })
+        UI.corner(button, true)
+        local glyph = UI.icon(button, icon, 15, "sub", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+        local scale = UI.scaleOf(button)
+        local hit = UI.button(button, {
+            hover = function(on)
+                Motion.to(button, "BackgroundTransparency", on and (tone and 0.8 or T.fill3A) or T.fill1A, "quick")
+                Theme.bind(button, "BackgroundColor3", on and tone or "ink")
+                Theme.bind(glyph, "ImageColor3", on and (tone or "ink") or "sub")
+            end,
+            press = function(on) Motion.to(scale, "Scale", on and 0.9 or 1, on and "quick" or "bouncy") end,
+            click = run,
+        })
+        UI.tooltip(hit, tip)
+    end
+    roundButton("x", -4, "bad", function() Window.show(false) end, "Hide (" .. Config.keyLabel(Config.get("app.key.menu")) .. ")")
+    roundButton("minus", -40, nil, function() Window.show(false) end, "Minimise")
+    Window.pageHost = UI.frame(glass, { Name = "Pages", Size = UDim2.new(0, CONTENT_W, 1, -(HEADER + 16)),
+        Position = UDim2.fromOffset(CONTENT_X, HEADER + 6), ClipsDescendants = true })
+    local fade = UI.frame(glass, { Name = "EdgeTop", Size = UDim2.new(0, CONTENT_W, 0, 14),
+        Position = UDim2.fromOffset(CONTENT_X, HEADER + 6), ZIndex = 7, Theme = { BackgroundColor3 = "base" }, Interactable = false })
+    UI.gradient(fade, { Rotation = 90, Transparency = UI.alphaSeq(0, 0.25, 1, 1) })
+    Window.edgeTop = fade
+    UI.mountOverlay(gui, function() return sizer.Scale end)
+    local position = Motion.spring(2, "snappy", function(x) holder.Position = UDim2.fromOffset(x[1], x[2]) end, 0.2)
+    Window.position = position
+    local function clampTo(x, y)
+        local view = G.viewport()
+        local hw, hh = W * sizer.Scale / 2, H * sizer.Scale / 2
+        return math.clamp(x, 140 - hw, view.X + hw - 140), math.clamp(y, hh * 0.25, view.Y + hh - 80)
+    end
+    Window.clampTo = clampTo
+    local startX, startY
+    local function dragFrom(handle)
+        UI.drag(handle, function()
+            UI.closePopovers()
+            startX, startY = position.g[1], position.g[2]
+        end, function(_, delta)
+            local x, y = clampTo(startX + delta.X, startY + delta.Y)
+            position:to({ x, y }, "quick")
+        end, function()
+            local view = G.viewport()
+            Config.set("app.window.x", position.g[1] / view.X)
+            Config.set("app.window.y", position.g[2] / view.Y)
+        end)
+    end
+    local grip = UI.new("TextButton", { Name = "Grip", Text = "", BackgroundTransparency = 1, AutoButtonColor = false,
+        Size = UDim2.new(1, -260, 1, 0), ZIndex = 2, Parent = header })
+    dragFrom(grip)
+    local grip2 = UI.new("TextButton", { Name = "Grip", Text = "", BackgroundTransparency = 1, AutoButtonColor = false,
+        Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = brand })
+    dragFrom(grip2)
+    local rimAngle = Motion.spring(1, "gentle", function(x) rim.Rotation = x[1] end, 0.05)
+    rimAngle:snap({ 52 })
+    Motion.every(function()
+        if not Window.open then return end
+        local mouse = UI.mouse()
+        local p, s = holder.AbsolutePosition, holder.AbsoluteSize
+        local dx, dy = mouse.X - (p.X + s.X / 2), mouse.Y - (p.Y + s.Y / 2)
+        local angle = math.deg(math.atan2(dy, dx)) + 180
+        local current = rimAngle.g[1]
+        local diff = (angle - current + 180) % 360 - 180
+        if math.abs(diff) > 1.5 then rimAngle:to({ current + diff }) end
+    end, 30, "window.rim")
+    Window.rebuildNav()
+    Window.rescale()
+    G.connect(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"), function() Window.rescale() end, "window.viewport")
+end
+
+function Window.rescale()
+    if not Window.built then return end
+    local view = G.viewport()
+    local auto = math.clamp(math.min(view.Y / 1090, view.X / 1500), 0.55, 1.5)
+    local user = (Config.get("app.scale") or 100) / 100
+    local scale = math.min(auto * user, (view.X - 24) / W, (view.Y - 24) / H)
+    Window.scale = scale
+    Motion.to(Window.sizer, "Scale", scale * (Window.open and 1 or 0.95), "smooth")
+    local fx, fy = Config.get("app.window.x") or 0.5, Config.get("app.window.y") or 0.5
+    local x, y = Window.clampTo(fx * view.X, fy * view.Y)
+    Window.position:snap({ x, y })
+end
+
+local selected = Motion.spring(2, "snappy", function(x)
+    local pill = Window.navPill
+    if not pill then return end
+    local a, b = math.min(x[1], x[2]), math.max(x[1], x[2])
+    pill.Position = UDim2.fromOffset(0, a)
+    pill.Size = UDim2.new(1, 0, 0, math.max(8, b - a))
+end, 0.15)
+function Window.rebuildNav()
+    local host = Window.navHost
+    for _, item in ipairs(navItems) do item.frame:Destroy() end
+    for _, child in ipairs(host:GetChildren()) do
+        if child.Name == "Group" then child:Destroy() end
+    end
+    table.clear(navItems)
+    local y = 0
+    local lastGroup
+    for _, page in ipairs(Window.order) do
+        if not page.hidden then
+            if page.group ~= lastGroup then
+                lastGroup = page.group
+                if page.group ~= "" then
+                    y += 10
+                    local label = UI.text(host, string.upper(page.group), "eyebrow", "faint",
+                        { Name = "Group", Position = UDim2.fromOffset(12, y), TextSize = 9 })
+                    label.Name = "Group"
+                    y += 22
+                end
+            end
+            local item = UI.frame(host, { Name = "Item", Size = UDim2.new(1, 0, 0, 34), Position = UDim2.fromOffset(0, y),
+                Theme = { BackgroundColor3 = "ink" }, ZIndex = 2 })
+            UI.corner(item, "rControl")
+            local icon = UI.icon(item, page.icon, 17, "sub", { Position = UDim2.new(0, 12, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5) })
+            local label = UI.text(item, page.title, "label", "sub", { Position = UDim2.new(0, 39, 0.5, 0),
+                AnchorPoint = Vector2.new(0, 0.5), TextSize = 13.5 })
+            if page.badge then
+                UI.badge(item, page.badge, "accent", { Position = UDim2.new(1, -10, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5) })
+            end
+            local entry = { frame = item, icon = icon, label = label, page = page, y = y }
+            navItems[#navItems + 1] = entry
+            UI.button(item, {
+                hover = function(on)
+                    if Window.current == page then return end
+                    Motion.to(item, "BackgroundTransparency", on and 0.955 or 1, "quick")
+                end,
+                click = function() Window.go(page.id) end,
+            })
+            y += 36
+        end
+    end
+    if Window.current then Window.selectNav(Window.current, true) end
+end
+function Window.selectNav(page, instant)
+    local target
+    for _, entry in ipairs(navItems) do
+        local on = entry.page == page
+        Theme.bind(entry.icon, "ImageColor3", on and "accent" or "sub")
+        Theme.bind(entry.label, "TextColor3", on and "ink" or "sub")
+        Motion.to(entry.frame, "BackgroundTransparency", 1, "quick")
+        if on then target = entry end
+    end
+    if not target then Window.navPill.Visible = false; return end
+    local a, b = target.y, target.y + 34
+    if instant or not Window.navPill.Visible then
+        Window.navPill.Visible = true
+        selected:snap({ a, b })
+        return
+    end
+    local down = a > selected.g[1]
+    if down then selected:to({ selected.g[1], b }, "snappy")
+    else selected:to({ a, selected.g[2] }, "snappy") end
+    task.delay(0.05, function() if Window.current == page then selected:to({ a, b }, "liquid") end end)
+end
+function Window.setTitle(page, instant)
+    local clip = Window.titleClip
+    local old = Window.titleLabel
+    local label = UI.text(clip, page.title, "display", "ink", { Position = UDim2.fromOffset(0, instant and 2 or 46), Name = "Title" })
+    Window.titleLabel = label
+    Window.eyebrow.Text = string.upper(page.eyebrow or (page.group ~= "" and page.group or OBLITSO_CONFIG.ScriptName))
+    if instant then
+        if old then old:Destroy() end
+        return
+    end
+    Motion.to(label, "Position", UDim2.fromOffset(0, 2), "smooth")
+    if old then Motion.to(old, "Position", UDim2.fromOffset(0, -46), "smooth", function() old:Destroy() end) end
+end
+
+function Window.show(on, instant)
+    if not Window.built or Window.open == on then return end
+    Window.open = on
+    UI.closePopovers()
+    UI.hideTip()
+    local holder, root, sizer = Window.holder, Window.root, Window.sizer
+    Window.modal.Visible = on and Config.get("app.freeCursor") ~= false
+    if on then
+        holder.Visible = true
+        if not Window.current and Window.order[1] then Window.go(Window.startPage or Window.order[1].id, true) end
+        if instant then
+            UI.setFade(root, 1); Motion.snap(sizer, "Scale", Window.scale)
+            if Window.shadow then Window.shadow.Transparency = T.shadowA end
+        else
+            UI.setFade(root, 0)
+            Motion.snap(sizer, "Scale", Window.scale * 0.94)
+            UI.fade(root, 1, "smooth")
+            Motion.to(sizer, "Scale", Window.scale, "bouncy")
+            if Window.shadow then Motion.to(Window.shadow, "Transparency", T.shadowA, "gentle") end
+            UI.sfx("open", 0.8)
+        end
+    else
+        if Window.shadow then Motion.to(Window.shadow, "Transparency", 1, "quick") end
+        Motion.to(sizer, "Scale", Window.scale * 0.96, "quick")
+        UI.fade(root, 0, "quick", function() if not Window.open then holder.Visible = false end end)
+        if not root:IsA("CanvasGroup") then holder.Visible = false end
+        UI.sfx("close", 0.7)
+    end
+    Window.onShow:fire(on)
+end
+function Window.toggle() Window.show(not Window.open) end
+
+local palette
+function Window.palette()
+    if palette then palette.close(); return end
+    if not Window.built then return end
+    if not Window.open then Window.show(true) end
+    for _, page in ipairs(Window.order) do ensureBuilt(page) end
+    local scale = Window.scale
+    local view = G.viewport()
+    local veil = UI.new("TextButton", { Name = "Veil", Text = "", AutoButtonColor = false, Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 1, ZIndex = 70, Parent = UI.overlay })
+    Motion.to(veil, "BackgroundTransparency", 0.62, "smooth")
+    local at, size = Window.holder.AbsolutePosition - UI.overlay.AbsolutePosition, Window.holder.AbsoluteSize
+    local half = 270 * scale
+    local holder = UI.frame(veil, { Name = "Palette", Size = UDim2.fromOffset(540, 0), AutomaticSize = Enum.AutomaticSize.Y,
+        AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromOffset(
+            math.clamp(at.X + size.X * 0.5, half + 12, math.max(half + 12, view.X - half - 12)),
+            math.clamp(at.Y + 72 * scale, 16, math.max(16, view.Y - 420 * scale))), ZIndex = 71 })
+    local sizer = Instance.new("UIScale"); sizer.Scale = scale * 0.95; sizer.Parent = holder
+    Motion.to(sizer, "Scale", scale, "bouncy")
+    local glass = UI.glass(holder, { level = "popover", radius = "rPanel", shadow = 60, shadowY = 26,
+        props = { Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y, Active = true } })
+    local stack = UI.frame(glass, { Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y })
+    UI.list(stack, "y", 0)
+    local top = UI.frame(stack, { Size = UDim2.new(1, 0, 0, 54), LayoutOrder = 1 })
+    UI.icon(top, "search", 18, "sub", { Position = UDim2.new(0, 18, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5) })
+    local box = UI.new("TextBox", { BackgroundTransparency = 1, Size = UDim2.new(1, -110, 1, 0), Position = UDim2.fromOffset(48, 0),
+        Text = "", PlaceholderText = "Search every setting and tab", FontFace = G.F.text500, TextSize = 16,
+        TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
+        Theme = { TextColor3 = "ink", PlaceholderColor3 = "faint" }, Parent = top })
+    UI.text(top, "esc", "mono", "faint", { Position = UDim2.new(1, -18, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5), TextSize = 11 })
+    UI.divider(stack, 2)
+    local list = UI.frame(stack, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 3 })
+    UI.pad(list, 6)
+    UI.list(list, "y", 2)
+    local rows, results, cursor = {}, {}, 1
+    local connection
+    local api = {}
+    function api.close()
+        if not palette then return end
+        palette = nil
+        if connection then connection:Disconnect() end
+        Motion.to(veil, "BackgroundTransparency", 1, "quick", function() veil:Destroy() end)
+        holder:Destroy()
+    end
+    local function highlight()
+        for index, row in ipairs(rows) do
+            Motion.to(row, "BackgroundTransparency", index == cursor and T.fill2A or 1, "quick")
+        end
+    end
+    local function run(result)
+        if not result then return end
+        api.close()
+        if result.kind == "page" then Window.go(result.page.id); return end
+        Window.go(result.page.id)
+        task.delay(0.12, function()
+            local entry = result.entry
+            if not entry.row.frame.Parent then return end
+            local scroller = result.page.frame
+            local offset = (entry.row.frame.AbsolutePosition.Y - scroller.AbsolutePosition.Y + scroller.CanvasPosition.Y) - 90 * Window.scale
+            result.page.scroll.to(offset)
+            entry.row.flash()
+        end)
+    end
+    local function refresh()
+        for _, row in ipairs(rows) do row:Destroy() end
+        table.clear(rows); table.clear(results)
+        local query = box.Text
+        local scored = {}
+        for _, page in ipairs(Window.order) do
+            local score = util.fuzzy(query, page.title)
+            if score then
+                scored[#scored + 1] = { kind = "page", page = page, label = page.title, sub = "Tab", icon = page.icon, score = score + 1.5 }
+            end
+        end
+        for _, entry in ipairs(Window.index) do
+            local score = util.fuzzy(query, entry.label)
+            if not score and query ~= "" and entry.desc ~= "" then
+                local other = util.fuzzy(query, entry.desc)
+                score = other and other - 4 or nil
+            end
+            if score then
+                scored[#scored + 1] = { kind = "control", page = entry.page, entry = entry, label = entry.label,
+                    sub = entry.page.title .. "  /  " .. tostring(entry.section), icon = entry.page.icon, score = score }
+            end
+        end
+        table.sort(scored, function(a, b) return a.score > b.score end)
+        for index = 1, math.min(8, #scored) do
+            local result = scored[index]
+            results[index] = result
+            local row = UI.frame(list, { Size = UDim2.new(1, 0, 0, 40), LayoutOrder = index, Theme = { BackgroundColor3 = "ink" } })
+            UI.corner(row, "rSmall")
+            UI.icon(row, result.icon, 16, result.kind == "page" and "accent" or "sub",
+                { Position = UDim2.new(0, 12, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5) })
+            UI.text(row, result.label, "label", "ink", { Position = UDim2.new(0, 40, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5), TextSize = 13.5 })
+            UI.text(row, result.sub, "caption", "faint", { Position = UDim2.new(1, -12, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5), TextSize = 11.5 })
+            UI.button(row, { hover = function(on) if on then cursor = index; highlight() end end, click = function() run(result) end })
+            rows[index] = row
+        end
+        if #scored == 0 then
+            local row = UI.frame(list, { Size = UDim2.new(1, 0, 0, 56) })
+            UI.text(row, "No setting matches " .. query, "body", "faint",
+                { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+            rows[1] = row
+        end
+        cursor = 1
+        highlight()
+    end
+    box:GetPropertyChangedSignal("Text"):Connect(G.safe("palette", refresh))
+    connection = UIS.InputBegan:Connect(G.safe("palette.key", function(input)
+        if input.KeyCode == Enum.KeyCode.Down then cursor = math.min(#results, cursor + 1); highlight()
+        elseif input.KeyCode == Enum.KeyCode.Up then cursor = math.max(1, cursor - 1); highlight()
+        elseif input.KeyCode == Enum.KeyCode.Return or input.KeyCode == Enum.KeyCode.KeypadEnter then run(results[cursor])
+        elseif input.KeyCode == Enum.KeyCode.Escape then api.close() end
+    end))
+    veil.Activated:Connect(function() api.close() end)
+    palette = api
+    refresh()
+    box:CaptureFocus()
+    UI.sfx("open", 0.6)
+end
+end
+
+do -- 08_api.lua
+-- ============================================================================
+--  08 api      the public surface the caller gets back
+-- ============================================================================
+local util, Motion, Theme, T, UI, Config, Window, Controls = G.util, G.Motion, G.Theme, G.T, G.UI, G.Config, G.Window, G.Controls
+
+local API = {}
+
+function API:Show(instant) Window.show(true, instant) end
+function API:Hide() Window.show(false) end
+function API:Toggle() Window.toggle() end
+function API:Toast(opts) return Window.toast(opts) end
+function API:Palette() Window.palette() end
+function API:Destroy() G.unload() end
+function API:Get(id) return Config.get(id) end
+function API:Set(id, value) Config.set(id, value) end
+function API:Bind(id, key, mode) Config.bind(id, key, mode) end
+function API:Export() return Config.export() end
+function API:Import(json) return Config.import(json) end
+function API:Page(spec) return Window.page(spec) end
+function API:RemovePage(id) Window.removePage(id) end
+
+local scriptSlug = (string.gsub(tostring(OBLITSO_CONFIG.ScriptName), "%W", "_"))
+local rayfieldFlagPrefix = "rf." .. scriptSlug .. "."
+
+local function flagFor(flag, fallback)
+    if flag and flag ~= "" then
+        local clean = string.gsub(tostring(flag), "%W", "_")
+        return rayfieldFlagPrefix .. clean
+    end
+    return fallback or (rayfieldFlagPrefix .. util.randomName())
+end
+
+local function normalizeOptions(list)
+    local out = {}
+    for _, option in ipairs(list or {}) do
+        if type(option) == "table" then
+            out[#out + 1] = { value = option[1] or option.value, label = option[2] or option.label or tostring(option[1] or option.value) }
+        else
+            out[#out + 1] = { value = option, label = tostring(option) }
+        end
+    end
+    return out
+end
+
+local function makeControlRef(api, kind)
+    local ref = { __kind = kind }
+    if kind == "toggle" or kind == "slider" then
+        function ref:Set(v) api.set(v) end
+        function ref:Get() return api.get() end
+        function ref:SetValue(v) api.set(v) end
+    elseif kind == "dropdown" or kind == "multi" then
+        function ref:Set(v) api.set(v) end
+        function ref:Get() return api.get() end
+        function ref:Refresh(list) if api.options then api.options(list) end end
+    elseif kind == "color" then
+        function ref:Set(v) api.set(v) end
+        function ref:Get() return api.get() end
+    elseif kind == "keybind" then
+        function ref:Set(v) if api.id then Config.set(api.id, v) end end
+        function ref:Get() return api.get() end
+    elseif kind == "input" then
+        function ref:Set(v) if api.id then Config.set(api.id, v) end end
+        function ref:Get() return api.get() end
+    end
+    return ref
+end
+
+local function buildShim()
+    local shim = {}
+    local tabs = {}
+
+    local function newTab(name, icon)
+        local slug = (string.gsub(tostring(name or "tab"), "[^%w]", "_"))
+        local page = Window.page({
+            id = "rf." .. slug,
+            title = tostring(name or "Tab"),
+            icon = icon or "circle",
+            group = "",
+        })
+        local tabRef = {}
+        function tabRef:CreateSection(sectionName)
+            local section = page:Section({ title = tostring(sectionName or "Section") })
+            local sectionRef = {}
+
+            function sectionRef:CreateToggle(spec)
+                spec = spec or {}
+                local id = flagFor(spec.Flag)
+                local api = section:Toggle({
+                    id = id,
+                    label = tostring(spec.Name or "Toggle"),
+                    default = spec.CurrentValue == true,
+                    changed = spec.Callback and function(v) G.try("rf.toggle", spec.Callback, v) end,
+                })
+                return makeControlRef(api, "toggle")
+            end
+
+            function sectionRef:CreateSlider(spec)
+                spec = spec or {}
+                local id = flagFor(spec.Flag)
+                local range = spec.Range or { 0, 100 }
+                local api = section:Slider({
+                    id = id,
+                    label = tostring(spec.Name or "Slider"),
+                    min = range[1] or 0,
+                    max = range[2] or 100,
+                    step = spec.Increment or 1,
+                    default = spec.CurrentValue,
+                    suffix = spec.Suffix and (" " .. tostring(spec.Suffix)) or nil,
+                    decimals = spec.Decimals,
+                    changed = spec.Callback and function(v) G.try("rf.slider", spec.Callback, v) end,
+                })
+                return makeControlRef(api, "slider")
+            end
+
+            function sectionRef:CreateDropdown(spec)
+                spec = spec or {}
+                local id = flagFor(spec.Flag)
+                local options = normalizeOptions(spec.Options)
+                local api = section:Dropdown({
+                    id = id,
+                    label = tostring(spec.Name or "Dropdown"),
+                    options = options,
+                    default = spec.CurrentOption,
+                    changed = spec.Callback and function(v) G.try("rf.dropdown", spec.Callback, v) end,
+                })
+                return makeControlRef(api, "dropdown")
+            end
+
+            function sectionRef:CreateKeybind(spec)
+                spec = spec or {}
+                local keyId = flagFor(spec.Flag, nil) or (rayfieldFlagPrefix .. "kb_" .. util.randomName())
+                keyId = keyId .. ".key"
+                local stateId = string.sub(keyId, 1, #keyId - 4) .. ".state"
+                local hold = spec.HoldToInteract == true
+                local mode = hold and "hold" or "toggle"
+
+                Config.define(keyId, spec.CurrentKeybind or "None")
+                Config.define(stateId, false)
+
+                Config.on(keyId, function(newKey)
+                    if not newKey or newKey == "None" then
+                        Config.bind(stateId, nil)
+                    else
+                        Config.bind(stateId, newKey, mode)
+                    end
+                end)
+                local initialKey = Config.get(keyId)
+                if initialKey and initialKey ~= "None" then
+                    Config.bind(stateId, initialKey, mode)
+                end
+
+                if spec.Callback then
+                    Config.on(stateId, function(v) G.try("rf.keybind", spec.Callback, v) end)
+                end
+
+                local api = section:Keybind({
+                    id = keyId,
+                    label = tostring(spec.Name or "Keybind"),
+                    default = spec.CurrentKeybind or "None",
+                })
+                return makeControlRef(api, "keybind")
+            end
+
+            function sectionRef:CreateButton(spec)
+                spec = spec or {}
+                local api = section:Button({
+                    label = tostring(spec.Name or "Button"),
+                    text = tostring(spec.Name or "Run"),
+                    run = spec.Callback and function() G.try("rf.button", spec.Callback) end,
+                })
+                return makeControlRef(api, "button")
+            end
+
+            function sectionRef:CreateColorPicker(spec)
+                spec = spec or {}
+                local id = flagFor(spec.Flag)
+                local api = section:Color({
+                    id = id,
+                    label = tostring(spec.Name or "Colour"),
+                    default = spec.Color or spec.CurrentValue or Color3.new(1, 1, 1),
+                    changed = spec.Callback and function(v) G.try("rf.color", spec.Callback, v) end,
+                })
+                return makeControlRef(api, "color")
+            end
+
+            function sectionRef:CreateInput(spec)
+                spec = spec or {}
+                local id = flagFor(spec.Flag)
+                local api = section:Input({
+                    id = id,
+                    label = tostring(spec.Name or "Input"),
+                    placeholder = spec.PlaceholderText and tostring(spec.PlaceholderText) or "",
+                    default = spec.CurrentValue and tostring(spec.CurrentValue) or "",
+                    changed = spec.Callback and function(v) G.try("rf.input", spec.Callback, v) end,
+                })
+                return makeControlRef(api, "input")
+            end
+
+            function sectionRef:CreateLabel(text)
+                section:Note({ text = tostring(text or "") })
+                return { Set = function() end }
+            end
+
+            function sectionRef:CreateParagraph(spec)
+                spec = spec or {}
+                local note = section:Note({ icon = "info", text = tostring(spec.Content or "") })
+                return { Set = function(v) note.set(tostring(v or "")) end }
+            end
+
+            function sectionRef:CreateDivider()
+                section:Note({ text = "" })
+                return {}
+            end
+
+            return sectionRef
+        end
+
+        tabs[#tabs + 1] = tabRef
+        return tabRef
+    end
+
+    function shim:CreateWindow(spec)
+        Window.show(true)
+        return shim
+    end
+    function shim:CreateTab(name, icon) return newTab(name, icon) end
+    function shim:Toggle() Window.toggle() end
+    function shim:Close() Window.show(false) end
+    function shim:Notify(spec)
+        spec = spec or {}
+        Window.toast({
+            title = tostring(spec.Title or spec.Name or "Notice"),
+            text = spec.Content and tostring(spec.Content) or nil,
+            icon = "info",
+            time = spec.Duration or 3.6,
+        })
+    end
+    function shim:Destroy() G.unload() end
+    function shim:GetTabs() return tabs end
+    return shim
+end
+
+local rayfieldShim
+local function getRayfield()
+    if not rayfieldShim then rayfieldShim = buildShim() end
+    return rayfieldShim
+end
+
+function API:Rayfield() return getRayfield() end
+
+G.API = API
+G.getRayfield = getRayfield
+end
+
+do -- 08b_splash.lua
+-- ============================================================================
+--  08b splash   OBL ray loader. Rays from letter tops, glow pads behind
+--  shiny letters. Optional subtitle under the word.
+-- ============================================================================
+local S, util, Motion, Theme, T, UI = G.S, G.util, G.Motion, G.Theme, G.T, G.UI
+
+local Splash = { finished = false, gui = nil }
+G.Splash = Splash
+
+local WORD       = "OBL"
+local SHINE      = Color3.fromRGB(0, 220, 140)
+local SHINE_HOT  = Color3.fromRGB(160, 255, 210)
+local BASE       = Color3.fromRGB(235, 235, 240)
+local LETTER_W   = 108
+local LETTER_H   = 118
+local RAY_W      = 8
+local RAY_LEN    = 190
+
+local function rayChildren(holder)
+    local out = {}
+    for _, c in ipairs(holder:GetChildren()) do
+        if c.Name == "Ray" then out[#out + 1] = c end
+    end
+    return out
+end
+
+function Splash.show()
+    if Splash.gui then return end
+    local subtitle = OBLITSO_CONFIG.Subtitle
+    if type(subtitle) ~= "string" or subtitle == "" then subtitle = nil end
+
+    local gui = G.screen(9900, "OBLITSO_SPLASH_" .. util.randomName())
+    Splash.gui = gui
+
+    local backdrop = UI.frame(gui, { Name = "Backdrop", Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.fromRGB(8, 8, 12), BackgroundTransparency = 1 })
+
+    local center = UI.frame(gui, { Name = "Center", Size = UDim2.fromScale(1, 1) })
+
+    local word = UI.frame(center, { Name = "Word", AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.46), Size = UDim2.fromOffset(#WORD * LETTER_W, LETTER_H),
+        BackgroundTransparency = 1, ClipsDescendants = false })
+    UI.list(word, "x", 0, { v = "Center" })
+
+    local letters = {}
+    for i = 1, #WORD do
+        local ch = string.sub(WORD, i, i)
+        local shiny = (i % 2 == 0)
+        local holder = UI.frame(word, { Name = "L" .. i, Size = UDim2.fromOffset(LETTER_W, LETTER_H),
+            BackgroundTransparency = 1, LayoutOrder = i, ClipsDescendants = false })
+
+        if shiny then
+            local pad = UI.frame(holder, { Name = "GlowPad",
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+                Size = UDim2.fromOffset(LETTER_W + 40, LETTER_H + 20),
+                BackgroundColor3 = SHINE, BackgroundTransparency = 1, ZIndex = 0, BorderSizePixel = 0 })
+            UI.corner(pad, true)
+            UI.gradient(pad, { Rotation = 90, Transparency = UI.alphaSeq(
+                0, 1, 0.35, 0.55, 0.7, 0.75, 1, 1) })
+            holder.GlowPad = pad
+
+            for _, dir in ipairs({ -1, 1 }) do
+                local ray = UI.frame(holder, { Name = "Ray",
+                    AnchorPoint = Vector2.new(0.5, 1),
+                    Position = UDim2.new(0.5, 0, 0.18, 0),
+                    Size = UDim2.fromOffset(RAY_W, RAY_LEN),
+                    BackgroundColor3 = SHINE, BackgroundTransparency = 1,
+                    BorderSizePixel = 0, Rotation = dir * 45, ZIndex = 1 })
+                UI.corner(ray, true)
+                UI.gradient(ray, { Rotation = 90, Transparency = UI.alphaSeq(
+                    0, 1, 0.25, 0.65, 0.55, 0.35, 1, 1) })
+            end
+        end
+
+        local label = UI.new("TextLabel", {
+            Name = "Glyph", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+            Font = Enum.Font.GothamBlack, TextSize = 104, Text = ch,
+            TextColor3 = shiny and SHINE or BASE, TextTransparency = 1, ZIndex = 2,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            TextYAlignment = Enum.TextYAlignment.Center, Parent = holder })
+
+        letters[i] = { label = label, holder = holder, shiny = shiny }
+    end
+
+    local sub
+    if subtitle then
+        sub = UI.new("TextLabel", {
+            Name = "Subtitle", BackgroundTransparency = 1,
+            AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.58, 0),
+            Size = UDim2.fromOffset(420, 22), Font = Enum.Font.GothamMedium, TextSize = 15,
+            Text = subtitle, TextColor3 = Color3.fromRGB(150, 150, 165),
+            TextTransparency = 1, TextXAlignment = Enum.TextXAlignment.Center,
+            TextYAlignment = Enum.TextYAlignment.Center, Parent = center })
+    end
+
+    local TS = S.TweenService
+    local info = TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+
+    TS:Create(backdrop, TweenInfo.new(0.4, Enum.EasingStyle.Quart), { BackgroundTransparency = 0.35 }):Play()
+
+    for i = 1, #WORD do
+        task.delay((i - 1) * 0.08, function()
+            if Splash.finished or not letters[i].label.Parent then return end
+            TS:Create(letters[i].label, info, { TextTransparency = 0 }):Play()
+        end)
+    end
+
+    task.delay(0.45, function()
+        if Splash.finished then return end
+        for _, entry in ipairs(letters) do
+            if entry.shiny then
+                if entry.holder.GlowPad then
+                    TS:Create(entry.holder.GlowPad, TweenInfo.new(0.5, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.72 }):Play()
+                end
+                for _, ray in ipairs(rayChildren(entry.holder)) do
+                    TS:Create(ray, TweenInfo.new(0.5, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.5 }):Play()
+                end
+            end
+        end
+        if sub then TS:Create(sub, TweenInfo.new(0.4), { TextTransparency = 0 }):Play() end
+    end)
+
+    task.spawn(function()
+        while not Splash.finished do
+            for _, entry in ipairs(letters) do
+                if entry.shiny and entry.label.Parent then
+                    TS:Create(entry.label, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { TextColor3 = SHINE_HOT }):Play()
+                    if entry.holder.GlowPad then
+                        TS:Create(entry.holder.GlowPad, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.55 }):Play()
+                    end
+                    task.delay(0.35, function()
+                        if entry.label.Parent and not Splash.finished then
+                            TS:Create(entry.label, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { TextColor3 = SHINE }):Play()
+                            if entry.holder.GlowPad then
+                                TS:Create(entry.holder.GlowPad, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.72 }):Play()
+                            end
+                        end
+                    end)
+                end
+            end
+            task.wait(0.9)
+        end
+    end)
+
+    Splash.backdrop = backdrop
+    Splash.subtitle = sub
+    Splash.letters = letters
+end
+
+function Splash.hide(instant)
+    if Splash.finished and not instant then return end
+    if not Splash.gui then return end
+    Splash.finished = true
+    local captured = Splash.gui
+    Splash.gui = nil
+    Splash.letters = nil
+    Splash.subtitle = nil
+    Splash.backdrop = nil
+    if instant then
+        pcall(function() captured:Destroy() end)
+        return
+    end
+    local TS = S.TweenService
+    local info = TweenInfo.new(0.32, Enum.EasingStyle.Quart, Enum.EasingDirection.In)
+    for _, child in ipairs(captured:GetDescendants()) do
+        if child:IsA("TextLabel") then
+            pcall(function() TS:Create(child, info, { TextTransparency = 1 }):Play() end)
+        elseif child:IsA("Frame") then
+            pcall(function() TS:Create(child, info, { BackgroundTransparency = 1 }):Play() end)
+        end
+    end
+    task.delay(0.5, function() pcall(function() captured:Destroy() end) end)
+end
+
+G.splashShow = Splash.show
+G.splashHide = Splash.hide
+G.splashKill = function() Splash.hide(true) end
+end
+
+do -- 09_boot.lua
+-- ============================================================================
+--  09 boot     order of operations, autoload warnings, danger toast
+-- ============================================================================
+local S, util, Motion, Theme, T, UI, Config, Window, Assets, API, Controls = G.S, G.util, G.Motion, G.Theme, G.T, G.UI, G.Config, G.Window, G.Assets, G.API, G.Controls
+
+Config.sessionDangerOverride = false
+
+Config.define("app.scheme", OBLITSO_CONFIG.Scheme or "oblitos")
+Config.define("app.accent", Theme.accentOf(OBLITSO_CONFIG.Accent or "greenglass"))
+Config.define("app.glass", OBLITSO_CONFIG.Glass or 60)
+Config.define("app.radius", 100)
+Config.define("app.scale", 100)
+Config.define("app.motion", "full")
+Config.define("app.motionSpeed", 100)
+Config.define("app.sfx", false)
+Config.define("app.sfxVolume", 45)
+Config.define("app.key.menu", OBLITSO_CONFIG.PanicKey == "None" and "RightControl" or (OBLITSO_CONFIG.PanicKey or "RightControl"))
+Config.define("app.key.panic", OBLITSO_CONFIG.PanicKey or "F7")
+Config.define("app.freeCursor", true)
+Config.define("app.window.x", 0.5)
+Config.define("app.window.y", 0.5)
+Config.define("app.island", true)
+Config.define("app.toasts", true)
+Config.define("app.scrollbar", "always")
+Config.define("app.danger.override", false)
+
+local function applyPrefs()
+    Theme.state.scheme = Config.get("app.scheme")
+    Theme.state.accent = Config.get("app.accent")
+    Theme.state.glass = Config.get("app.glass") / 100
+    Theme.state.radius = Config.get("app.radius") / 100
+    Theme.apply()
+    Motion.reduced = Config.get("app.motion") == "reduced"
+    Motion.speed = Config.get("app.motionSpeed") / 100
+    UI.sfxOn = Config.get("app.sfx")
+    UI.sfxVolume = Config.get("app.sfxVolume") / 100
+    UI.setScrollbar(Config.get("app.scrollbar"))
+    Config.on("app.scheme", function(v) Theme.set({ scheme = v }) end)
+    Config.on("app.accent", function(v) Theme.set({ accent = v }) end)
+    Config.on("app.glass", function(v) Theme.set({ glass = v / 100 }) end)
+    Config.on("app.radius", function(v) Theme.set({ radius = v / 100 }) end)
+    Config.on("app.scale", function() Window.rescale() end)
+    Config.on("app.motion", function(v) Motion.reduced = v == "reduced" end)
+    Config.on("app.motionSpeed", function(v) Motion.speed = v / 100 end)
+    Config.on("app.sfx", function(v) UI.sfxOn = v end)
+    Config.on("app.sfxVolume", function(v) UI.sfxVolume = v / 100 end)
+    Config.on("app.scrollbar", function(v) UI.setScrollbar(v) end)
+    Config.on("app.freeCursor", function(v) if Window.modal then Window.modal.Visible = Window.open and v end end)
+end
+
+local function buildHome()
+    Window.page({
+        id = "home", title = "Home", icon = "house", group = "", order = 1,
+        eyebrow = "Welcome back, " .. G.LP.DisplayName,
+        build = function(page)
+            page:Custom(180, function(frame)
+                local card = UI.surface(frame, { Name = "Hero", Size = UDim2.new(1, 0, 0, 180), ClipsDescendants = true }, "rCard")
+                UI.stroke(card, "ink", "strokeA")
+                local text = UI.frame(card, { Name = "Text", Size = UDim2.new(1, 0, 1, 0) })
+                UI.pad(text, 22, 0, 20, 24)
+                UI.list(text, "y", 6, { v = "Bottom" })
+                local eyebrow = UI.frame(text, { Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 1 })
+                UI.list(eyebrow, "x", 8, { v = "Center" })
+                local pip = UI.frame(eyebrow, { Size = UDim2.fromOffset(7, 7), LayoutOrder = 1,
+                    Theme = { BackgroundColor3 = "ok" }, BackgroundTransparency = 0 })
+                UI.corner(pip, true)
+                UI.text(eyebrow, "OBLITSO GUI LOADED", "eyebrow", "ok", { LayoutOrder = 2 })
+                UI.text(text, OBLITSO_CONFIG.ScriptName, "display", "ink",
+                    { TextSize = 46, LayoutOrder = 2, TextTruncate = Enum.TextTruncate.AtEnd,
+                      AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 0) })
+                UI.text(text, OBLITSO_CONFIG.Version, "body", "sub",
+                    { TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 0),
+                      LayoutOrder = 3, LineHeight = 1.25 })
+            end)
+            page:Custom(74, function(frame)
+                local row = UI.frame(frame, { Name = "Stats", Size = UDim2.new(1, 0, 0, 74) })
+                local tiles = {}
+                local specs = {
+                    { "activity", "FPS", function() return tostring(math.floor((1 / math.max(Motion.smoothDt, 1/1000)) + 0.5)) end },
+                    { "search", "PING", function()
+                        local ok, v = pcall(function() return G.LP:GetNetworkPing() * 1000 end)
+                        return tostring(math.floor(((ok and v) or 0) + 0.5)) .. " ms"
+                    end },
+                    { "sparkles", "PLAYERS", function() return #S.Players:GetPlayers() .. " / " .. S.Players.MaxPlayers end },
+                    { "circle", "SESSION", function()
+                        local s = math.floor(os.clock() - G.bootClock)
+                        return string.format("%d:%02d", s // 60, s % 60)
+                    end },
+                }
+                for index, spec in ipairs(specs) do
+                    local tile = UI.surface(row, { Size = UDim2.new(0.25, -9, 1, 0),
+                        Position = UDim2.new((index - 1) * 0.25, (index - 1) * 3, 0, 0) }, "rCard")
+                    UI.stroke(tile, "ink", "strokeA")
+                    UI.icon(tile, spec[1], 15, "faint", { Position = UDim2.fromOffset(14, 14) })
+                    UI.text(tile, spec[2], "eyebrow", "faint", { Position = UDim2.fromOffset(36, 15), TextSize = 9 })
+                    tiles[index] = { label = UI.text(tile, spec[3](), "monoBold", "ink",
+                        { Position = UDim2.fromOffset(14, 40), TextSize = 19 }), read = spec[3] }
+                end
+                Motion.every(function()
+                    if not row.Parent then return end
+                    for _, tile in ipairs(tiles) do tile.label.Text = tile.read() end
+                end, 2, "home.stats")
+            end)
+            local quick = page:Section({ title = "Quick actions", icon = "zap" })
+            quick:Button({ label = "Open command palette", text = "Search", bindable = false,
+                run = function() Window.palette() end })
+            quick:Button({ label = "Hide this window", text = "Hide", bindable = false,
+                run = function() Window.show(false) end })
+            local tips = page:Section({ title = "Good to know", icon = "lightbulb" })
+            tips:Note({ icon = "keyboard", text = "Right-click any toggle or button to bind it or flag it as dangerous." })
+            tips:Note({ icon = "search", text = "Ctrl " .. string.upper(tostring(OBLITSO_CONFIG.SearchKey or "K")) .. " opens the search palette." })
+            tips:Note({ icon = "eye-off", text = Config.keyLabel(Config.get("app.key.menu")) .. " hides the window. " .. Config.keyLabel(Config.get("app.key.panic")) .. " unloads." })
+        end,
+    })
+end
+
+local function buildSafetySection(page)
+    local safety = page:Section({ title = "Safety", icon = "shield",
+        desc = "Toggles flagged dangerous will not auto-enable when a config loads. Flip the override below to allow them this session." })
+    safety:Toggle({
+        id = "app.danger.override",
+        label = "Allow dangerous toggles this session",
+        desc = "Resets on next execution. Only enable if you accept the ban risk.",
+        default = false, bindable = false,
+        changed = function(v)
+            Config.sessionDangerOverride = v
+            local list = Config.listProfiles()
+            local target = Config.profile
+            if v then
+                if target and target ~= "" then
+                    local data = fsReadProfile(target)
+                    if data then
+                        for id, source in pairs(Config.danger) do
+                            if data[id] == true then Config.set(id, true) end
+                        end
+                    end
+                end
+            else
+                for id, source in pairs(Config.danger) do
+                    if Config.values[id] == true then Config.set(id, false) end
+                end
+            end
+        end,
+    })
+    safety:Custom({ name = "DangerList", build = function(frame)
+        Config.dangerChanged = Config.dangerChanged or G.Signal.new()
+        local function render()
+            for _, child in ipairs(frame:GetChildren()) do child:Destroy() end
+            local rows = {}
+            for id, source in pairs(Config.danger) do
+                local spec = G.Controls.specs[id]
+                if spec then
+                    rows[#rows + 1] = { id = id, label = spec.label or id, source = source, value = Config.values[id] }
+                end
+            end
+            table.sort(rows, function(a, b) return a.label < b.label end)
+            if #rows == 0 then
+                UI.text(frame, "No toggles flagged as dangerous.", "caption", "faint",
+                    { TextWrapped = true, Size = UDim2.new(1, 0, 0, 24), AutomaticSize = Enum.AutomaticSize.Y })
+                return
+            end
+            UI.list(frame, "y", 0)
+            for i, entry in ipairs(rows) do
+                local row = UI.frame(frame, { Name = "D", Size = UDim2.new(1, 0, 0, 34), LayoutOrder = i })
+                UI.text(row, entry.label, "label", "ink",
+                    { Position = UDim2.fromOffset(0, 0), Size = UDim2.new(1, -180, 0, 34), AutomaticSize = Enum.AutomaticSize.None, TextSize = 13 })
+                local srcTag = UI.badge(row, entry.source == "owner" and "OWNER" or "YOU",
+                    entry.source == "owner" and "accent" or "warn",
+                    { Position = UDim2.new(1, -110, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5) })
+                if entry.source == "user" then
+                    local pill = UI.pressable(row, {
+                        Name = "Unflag", Size = UDim2.fromOffset(0, 22), AutomaticSize = Enum.AutomaticSize.X,
+                        Position = UDim2.new(1, 0, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5),
+                        Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" } })
+                    UI.corner(pill, 6); UI.pad(pill, 0, 8)
+                    UI.text(pill, "unflag", "mono", "sub",
+                        { Size = UDim2.fromScale(0, 1), AutomaticSize = Enum.AutomaticSize.X, TextSize = 11 })
+                    UI.wire(pill, { click = function()
+                        Config.setDanger(entry.id, nil)
+                        if Config.values[entry.id] == true then Config.set(entry.id, false) end
+                        Config.dangerChanged:fire(entry.id)
+                    end })
+                end
+            end
+        end
+        render()
+        Config.dangerChanged:connect(function() if frame.Parent then render() end end)
+    end })
+end
+
+local function fsReadProfile(name)
+    if not name or name == "" then return nil end
+    local path = Config.dir .. "/" .. name .. ".json"
+    local data = G.fs.readJson(path)
+    if type(data) ~= "table" or type(data.values) ~= "table" then return nil end
+    local out = {}
+    for id, raw in pairs(data.values) do
+        out[id] = raw
+    end
+    return out
+end
+
+local function buildSettings()
+    Window.page({
+        id = "settings", title = "Settings", icon = "settings", group = "Framework", order = 99999,
+        eyebrow = "Make it yours",
+        build = function(page)
+            local look = page:Section({ title = "Appearance", icon = "palette", desc = "Changes apply live." })
+            look:Segmented({ id = "app.scheme", label = "Scheme",
+                options = { { "oblitos", "Oblitso" }, { "graphite", "Graphite" }, { "midnight", "Midnight" }, { "porcelain", "Porcelain" } },
+                width = 300 })
+            look:Custom({ height = 46, name = "Accent", build = function(frame)
+                local row = UI.frame(frame, { Size = UDim2.new(1, -28, 0, 30), Position = UDim2.fromOffset(14, 8) })
+                UI.list(row, "x", 9, { v = "Center" })
+                local rings = {}
+                local function mark()
+                    local current = Config.get("app.accent")
+                    for color, ring in pairs(rings) do
+                        Motion.to(ring, "Transparency", util.toHex(color) == util.toHex(current) and 0 or 1, "quick")
+                    end
+                end
+                for index, accent in ipairs(Theme.accents) do
+                    local swatch = UI.frame(row, { Size = UDim2.fromOffset(24, 24), BackgroundColor3 = accent.color, LayoutOrder = index })
+                    UI.corner(swatch, true)
+                    local ring = Instance.new("UIStroke")
+                    ring.Thickness = 2
+                    ring.Transparency = 1
+                    pcall(function() ring.BorderStrokePosition = Enum.BorderStrokePosition.Outer end)
+                    pcall(function() ring.BorderOffset = UDim.new(0, 2) end)
+                    Theme.bind(ring, "Color", "ink")
+                    ring.Parent = swatch
+                    rings[accent.color] = ring
+                    local scale = UI.scaleOf(swatch)
+                    local hit = UI.button(swatch, {
+                        hover = function(on) Motion.to(scale, "Scale", on and 1.12 or 1, "snappy") end,
+                        click = function() Config.set("app.accent", accent.color) end,
+                    })
+                    UI.tooltip(hit, accent.label)
+                end
+                local custom = UI.frame(row, { Size = UDim2.fromOffset(24, 24), LayoutOrder = 99,
+                    Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" } })
+                UI.corner(custom, true)
+                UI.icon(custom, "pipette", 13, "sub", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+                UI.button(custom, { click = function()
+                    Controls.colorPopover(custom, Config.get("app.accent"), function(color) Config.set("app.accent", color) end)
+                end })
+                Config.on("app.accent", function() if row.Parent then mark() end end)
+                mark()
+            end })
+            look:Slider({ id = "app.glass", label = "Glass", desc = "Clear on the left, tinted on the right.", min = 0, max = 100, step = 1, suffix = "%" })
+            look:Slider({ id = "app.radius", label = "Corner roundness", min = 40, max = 130, step = 5, suffix = "%" })
+            look:Slider({ id = "app.scale", label = "Interface size", desc = "It never grows past the screen.", min = 60, max = 160, step = 5, suffix = "%" })
+            look:Segmented({ id = "app.scrollbar", label = "Scrollbar", options = { { "always", "Always" }, { "auto", "Scrolling" }, { "off", "Off" } }, width = 232 })
+
+            local motion = page:Section({ title = "Motion", icon = "activity" })
+            motion:Segmented({ id = "app.motion", label = "Animations", options = { { "full", "Full" }, { "reduced", "Reduced" } }, width = 170 })
+            motion:Slider({ id = "app.motionSpeed", label = "Animation speed", min = 40, max = 250, step = 10, suffix = "%" })
+
+            buildSafetySection(page)
+
+            local keys = page:Section({ title = "Keys", icon = "keyboard" })
+            keys:Keybind({ id = "app.key.menu", label = "Open / close the window" })
+            keys:Keybind({ id = "app.key.panic", label = "Panic", desc = "Unloads the script instantly." })
+            keys:Toggle({ id = "app.freeCursor", label = "Free the cursor while open", desc = "Unlocks the mouse in first-person games.", bindable = false })
+            keys:Note({ icon = "info", text = "Right-click any toggle or button to bind it or flag it as dangerous." })
+
+            local screen = page:Section({ title = "On screen", icon = "monitor" })
+            screen:Toggle({ id = "app.toasts", label = "Show toasts", bindable = false })
+
+            local about = page:Section({ title = "About", icon = "info" })
+            local function stat(label, value)
+                about:Custom({ height = 34, build = function(frame)
+                    UI.text(frame, label, "label", "sub", { Position = UDim2.new(0, 14, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5), TextSize = 13 })
+                    local text = UI.text(frame, "", "mono", "ink", { Position = UDim2.new(1, -14, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5) })
+                    if type(value) == "function" then
+                        text.Text = tostring(value())
+                        Motion.every(function()
+                            if text.Parent and Window.open and Window.current and Window.current.id == "settings" then
+                                text.Text = tostring(value())
+                            end
+                        end, 2, "about")
+                    else text.Text = tostring(value) end
+                end })
+            end
+            stat("Loader", G.VERSION .. "  /  " .. G.BUILD)
+            stat("Script", OBLITSO_CONFIG.ScriptName)
+            stat("Version", OBLITSO_CONFIG.Version)
+            stat("Executor", G.executor)
+            stat("Fonts", function() return G.Assets.fontSource == "custom" and "custom pack" or "built-in fallback" end)
+            stat("Faults", function() return #G.faults end)
+            about:Button({ label = "Copy diagnostics", text = "Copy", bindable = false, run = function()
+                local lines = {
+                    "OBLITSO GUI " .. G.VERSION .. " " .. G.BUILD,
+                    "script " .. OBLITSO_CONFIG.ScriptName .. " " .. OBLITSO_CONFIG.Version,
+                    "executor " .. G.executor,
+                    "place " .. game.PlaceId .. " universe " .. game.GameId,
+                }
+                for _, fault in ipairs(G.faults) do
+                    lines[#lines + 1] = string.format("[%.1fs] %s: %s", fault.at, fault.scope, fault.message)
+                end
+                G.clipboard(table.concat(lines, "\n"))
+                Window.toast({ title = "Diagnostics copied", icon = "clipboard", tone = "ok" })
+            end })
+            about:Button({ label = "Unload", text = "Unload", style = "danger", bindable = false, run = function() G.unload() end })
+            about:Note({ text = "OBLITSO GUI is standalone. Every setting lives under " .. OBLITSO_CONFIG.SaveFolder .. "/ in the executor's workspace." })
+        end,
+    })
+end
+
+local function boot()
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    Config.init()
+    Assets.init()
+    applyPrefs()
+    Window.build()
+    buildHome()
+    buildSettings()
+    Window.rebuildNav()
+    Config.listen()
+
+    G.connect(S.UserInputService.InputBegan, function(input)
+        if Config.capturing then return end
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        if S.UserInputService:GetFocusedTextBox() then return end
+        local name = input.KeyCode.Name
+        if name == Config.get("app.key.menu") then
+            Window.toggle()
+        elseif name == Config.get("app.key.panic") then
+            G.unload()
+        elseif name == (OBLITSO_CONFIG.SearchKey or "K")
+            and (S.UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+              or S.UserInputService:IsKeyDown(Enum.KeyCode.RightControl))
+            and Window.open then
+            Window.palette()
+        end
+    end, "boot.keys")
+
+    Window.show(true)
+    task.delay(0.7, function() if G.alive then Window.prebuild() end end)
+    G.bootMs = math.floor((os.clock() - G.bootClock) * 1000)
+
+    -- Boot toasts (fire after the window is visible)
+    task.delay(0.9, function()
+        if not G.alive then return end
+        local profiles = Config.listProfiles()
+        local autoload = Config.getAutoload()
+        if #profiles > 0 and autoload == "" then
+            Window.toast({
+                title = "Saved configs found",
+                text = tostring(#profiles) .. " config(s) on disk. Open Settings to load one.",
+                icon = "save",
+                tone = "accent",
+                time = 6,
+            })
+        end
+        local skipped = Config.skippedDangerous or {}
+        if #skipped > 0 then
+            local names = {}
+            for i, id in ipairs(skipped) do
+                local spec = G.Controls.specs[id]
+                names[#names + 1] = spec and spec.label or id
+            end
+            local joined = table.concat(names, ", ")
+            local verb = #skipped == 1 and "is" or "are"
+            Window.toast({
+                title = "Ban risk warning",
+                text = joined .. " " .. verb .. " saved as On but have ban risks. Enable manually if you accept the risk.",
+                icon = "triangle-alert",
+                tone = "bad",
+                time = 12,
+            })
+        end
+    end)
+
+    if OBLITSO_CONFIG.Announce then
+        print("[OBLITSO " .. OBLITSO_CONFIG.ScriptName .. "] Loaded " .. OBLITSO_CONFIG.Version)
+    end
+    if OBLITSO_CONFIG.Log and OBLITSO_CONFIG.__dispatch then
+        OBLITSO_CONFIG.__dispatch(OBLITSO_CONFIG.ScriptName, OBLITSO_CONFIG.Version)
+    end
+end
+
+task.spawn(function()
+    if G.splashShow then G.splashShow() end
+    task.wait(0.5)
+    local ok, err = xpcall(boot, function(e) return tostring(e) .. "\n" .. debug.traceback("", 2) end)
+    if not ok then G.fault("boot", err) end
+    task.wait(1.0)
+    if G.splashKill then G.splashKill() else if G.splashHide then G.splashHide(true) end end
+end)
+
+local function keyFor(name)
+    return "_G.__OBLITSO_" .. (string.gsub(tostring(name or "script"), "%W", "_")) .. "_CLEANUP"
+end
+local CLEANUP_KEY = keyFor(OBLITSO_CONFIG.ScriptName)
+
+local existing = G.genv[CLEANUP_KEY]
+if type(existing) == "function" then
+    pcall(existing)
+end
+
+local function cleanup()
+    if G.genv[CLEANUP_KEY] == cleanup then G.genv[CLEANUP_KEY] = nil end
+    G.unload()
+end
+G.genv[CLEANUP_KEY] = cleanup
+
+local out = setmetatable({}, { __index = G.API })
+out.Rayfield = function(self) return G.getRayfield() end
+out.Config = Config
+out.Window = Window
+out.Theme = Theme
+out.Motion = Motion
+out.UI = UI
+out.Controls = Controls
+out.Util = G.util
+out.Fs = G.fs
+out.Version = G.VERSION
+out.Build = G.BUILD
+out.ScriptName = OBLITSO_CONFIG.ScriptName
+out.ScriptVersion = OBLITSO_CONFIG.Version
+out.CleanupKey = CLEANUP_KEY
+out.Toast = Window.toast
+out.Page = G.API.Page
+return out
+end
