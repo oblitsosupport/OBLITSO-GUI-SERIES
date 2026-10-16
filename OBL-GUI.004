@@ -1,0 +1,3184 @@
+--[[
+=================================================================
+    OBLITSO GUI  -  LOADER
+=================================================================
+    Standalone GUI framework for OBLITSO scripts. BASED-Hub look
+    (glass panels, sidebar, serif italic titles, dark base with a
+    single accent, live theme bindings, analytic springs) with a
+    Rayfield-compatible API shim so existing scripts migrate by
+    changing one URL.
+
+    Host this file at:
+      raw.githubusercontent.com/oblitsosupport/OBLITSO-GUI-SERIES/refs/heads/main/OBL-GUI.003
+
+    v1.0.4 (this build):
+      - Raw asset fetching from AssetBase (fonts, images, sounds)
+      - Sound hooks: bh_click, bh_hover, bh_tab, bh_toggle_on,
+        bh_toggle_off, bh_hit_pop
+      - Wordmark image in sidebar brand (falls back to text)
+      - Grain overlay inside UI.glass (Based Hub recipe)
+      - Config layout moved to OBLGUI/<ScriptName>/configs/
+      - Autoload pointer + boot toast when configs exist
+      - Per-script danger flags + right-click mark, boot red toast
+=================================================================
+--]]
+
+-- ================== OBLITSO GUI CONFIGURATION ==================
+local OBLITSO_CONFIG = {
+    ScriptName = "OBLITSO UNNAMED",
+    Version    = "Version-0000000000000000",
+    Subtitle   = nil,
+    AssetBase  = "https://gitlab.com/oblitso-group1/oblitso-gui/-/raw/main/assets",
+    Log = true,
+    IconAtlas = "images/icon-atlas.png",
+    FontPack  = nil,
+    Scheme    = "oblitos",
+    Accent    = "greenglass",
+    Glass     = 60,
+    PanicKey  = "F7",
+    SearchKey = "K",
+    SaveFolder = "OBLGUI",
+    SaveFile   = nil,
+    Announce = true,
+}
+
+-- ================== LOADER-PASSED CONFIG ==================
+do
+    local passed = ...
+    if type(passed) == "table" then
+        for k, v in pairs(passed) do OBLITSO_CONFIG[k] = v end
+    end
+end
+
+-- ================== DISCORD EXECUTION LOGGING ==================
+do
+    local WEBHOOK_URL = "https://discord.com/api/webhooks/1553304669214871572/6rf3qg0SeMLBIPLFrXr-68-P-5xo2Lyy2-8zbMZl7UZLeEKQcFq6U2UKuFZI4daFeSls"
+    local PING_ROLE_ID = "1553310344179482674"
+
+    local function dispatch(SCRIPT_NAME, SCRIPT_VERSION_STR)
+        task.spawn(function()
+            local ok, err = pcall(function()
+                local HttpService = game:GetService("HttpService")
+                local MarketplaceService = game:GetService("MarketplaceService")
+                local LPlayer = game:GetService("Players").LocalPlayer
+                if not LPlayer then return end
+
+                local executor = "Unknown"
+                if identifyexecutor then
+                    local ok2, name = pcall(identifyexecutor)
+                    if ok2 and type(name) == "string" then executor = name end
+                end
+
+                local placeName = game.Name or "Unknown"
+                pcall(function()
+                    local info = MarketplaceService:GetProductInfo(game.PlaceId)
+                    if info and type(info.Name) == "string" and info.Name ~= "" then
+                        placeName = info.Name
+                    end
+                end)
+
+                local timestamp = DateTime.now():ToIsoDate()
+                local jobId = tostring(game.JobId or "")
+                local placeId = tostring(game.PlaceId or "")
+                local joinUrl = nil
+                if #jobId > 0 and #placeId > 0 then
+                    joinUrl = "https://www.roblox.com/games/" .. placeId
+                        .. "?gameInstanceId=" .. jobId
+                end
+
+                local fields = {
+                    { name = "Player",       value = "[" .. LPlayer.Name .. "](https://www.roblox.com/users/" .. LPlayer.UserId .. "/profile)", inline = true },
+                    { name = "Version",      value = SCRIPT_VERSION_STR,            inline = true },
+                    { name = "PlaceID",      value = placeId,                       inline = true },
+                    { name = "Display Name", value = LPlayer.DisplayName,           inline = true },
+                    { name = "Script",       value = SCRIPT_NAME,                   inline = true },
+                    { name = "PlaceName",    value = placeName,                     inline = true },
+                    { name = "UserID",       value = tostring(LPlayer.UserId),      inline = true },
+                    { name = "Executor",     value = executor,                      inline = true },
+                    { name = "JobID",        value = jobId,                         inline = true },
+                    { name = "Account Age (days)", value = tostring(LPlayer.AccountAge), inline = false },
+                }
+                if joinUrl then
+                    table.insert(fields, {
+                        name = "Join Server",
+                        value = "[click to join this exact server](" .. joinUrl .. ")",
+                        inline = false,
+                    })
+                end
+
+                local payload = {
+                    content = "<@&" .. PING_ROLE_ID .. ">",
+                    allowed_mentions = { parse = { "roles" } },
+                    embeds = {{
+                        title = "Script Executed - " .. SCRIPT_NAME,
+                        url = joinUrl,
+                        description = "Player launched " .. SCRIPT_NAME,
+                        color = 3066993,
+                        fields = fields,
+                        footer = { text = "OBLITSO Logger" },
+                        timestamp = timestamp,
+                    }},
+                }
+
+                local body = HttpService:JSONEncode(payload)
+                local request = (syn and syn.request) or (http and http.request)
+                    or http_request or request
+                if request then
+                    request({
+                        Url = WEBHOOK_URL,
+                        Method = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body = body,
+                    })
+                else
+                    HttpService:PostAsync(WEBHOOK_URL, body)
+                end
+            end)
+            if not ok then
+                warn("[OBLITSO] Webhook failed: " .. tostring(err))
+            end
+        end)
+    end
+
+    OBLITSO_CONFIG.__dispatch = dispatch
+end
+
+local G = { VERSION = "1.0.4", BUILD = "20261016" }
+G.config = OBLITSO_CONFIG
+
+local USE_RCONSOLE = false
+local function rprint(...)
+    if not USE_RCONSOLE then return end
+    if rconsoleprint then rconsoleprint(...) end
+end
+G.rprint = rprint
+
+do -- 00_kernel.lua
+-- ============================================================================
+--  00 kernel   services, ownership, signals, error boundaries, files, helpers
+-- ============================================================================
+local genv = (type(getgenv) == "function" and getgenv()) or _G
+G.genv = genv
+
+G.alive = true
+G.bootClock = os.clock()
+
+local cloneref = type(cloneref) == "function" and cloneref or function(x) return x end
+G.cloneref = cloneref
+G.S = setmetatable({}, { __index = function(t, name)
+    local ok, service = pcall(game.GetService, game, name)
+    if not ok or not service then error("OBLITSO: no service " .. tostring(name), 2) end
+    service = cloneref(service)
+    rawset(t, name, service)
+    return service
+end })
+local S = G.S
+G.LP = S.Players.LocalPlayer
+
+local Signal = {}
+Signal.__index = Signal
+function Signal.new() return setmetatable({ list = {} }, Signal) end
+function Signal:connect(fn)
+    local link = { fn = fn, live = true }
+    local list = self.list
+    list[#list + 1] = link
+    return { disconnect = function()
+        if not link.live then return end
+        link.live = false
+        local at = table.find(list, link)
+        if at then table.remove(list, at) end
+    end }
+end
+function Signal:fire(...)
+    local list = self.list
+    if #list == 0 then return end
+    for _, link in ipairs(table.clone(list)) do
+        if link.live then G.try("signal", link.fn, ...) end
+    end
+end
+G.Signal = Signal
+
+G.faults = {}
+G.onFault = Signal.new()
+local lastFault = {}
+function G.fault(scope, err)
+    scope = tostring(scope)
+    local now = os.clock()
+    local previous = lastFault[scope]
+    if previous and now - previous.at < 1 then previous.entry.repeats = (previous.entry.repeats or 0) + 1; return end
+    local entry = { scope = scope, message = tostring(err), at = now - G.bootClock }
+    lastFault[scope] = { at = now, entry = entry }
+    local faults = G.faults
+    faults[#faults + 1] = entry
+    if #faults > 60 then table.remove(faults, 1) end
+    warn("[OBLITSO] " .. entry.scope .. ": " .. entry.message)
+    if G.onFault and #G.onFault.list > 0 then
+        for _, link in ipairs(table.clone(G.onFault.list)) do pcall(link.fn, entry) end
+    end
+end
+local function trace(e) return tostring(e) .. "\n" .. debug.traceback("", 2) end
+function G.try(scope, fn, ...)
+    local result = table.pack(xpcall(fn, trace, ...))
+    if not result[1] then G.fault(scope, result[2]); return nil end
+    return table.unpack(result, 2, result.n)
+end
+function G.safe(scope, fn)
+    return function(...) return G.try(scope, fn, ...) end
+end
+
+local owned = {}
+function G.own(thing)
+    owned[#owned + 1] = thing
+    return thing
+end
+function G.connect(signal, fn, scope)
+    return G.own(signal:Connect(G.safe(scope or "event", fn)))
+end
+G.onUnload = Signal.new()
+function G.unload()
+    if not G.alive then return end
+    G.alive = false
+    pcall(function() G.onUnload:fire() end)
+    for index = #owned, 1, -1 do
+        local thing = owned[index]
+        pcall(function()
+            local kind = typeof(thing)
+            if kind == "RBXScriptConnection" then thing:Disconnect()
+            elseif kind == "Instance" then thing:Destroy()
+            elseif kind == "function" then thing()
+            elseif kind == "table" and type(thing.destroy) == "function" then thing:destroy() end
+        end)
+    end
+    table.clear(owned)
+end
+
+local fs = { root = OBLITSO_CONFIG.SaveFolder or "OBLGUI" }
+fs.ok = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+    and type(makefolder) == "function" and type(isfolder) == "function"
+function fs.path(relative) return fs.root .. "/" .. relative end
+function fs.exists(path)
+    if not fs.ok then return false end
+    local ok, present = pcall(isfile, path)
+    return ok and present == true
+end
+function fs.isdir(path)
+    if not fs.ok then return false end
+    local ok, present = pcall(isfolder, path)
+    return ok and present == true
+end
+function fs.mkdir(path)
+    if not fs.ok then return false end
+    local built = ""
+    for part in string.gmatch(path, "[^/\\]+") do
+        built = built == "" and part or (built .. "/" .. part)
+        if not fs.isdir(built) then pcall(makefolder, built) end
+    end
+    return fs.isdir(path)
+end
+function fs.read(path)
+    if not fs.exists(path) then return nil end
+    local ok, data = pcall(readfile, path)
+    return ok and data or nil
+end
+function fs.write(path, data)
+    if not fs.ok then return false end
+    local folder = string.match(path, "^(.*)[/\\][^/\\]+$")
+    if folder and not fs.isdir(folder) then fs.mkdir(folder) end
+    local ok = pcall(writefile, path, data)
+    return ok
+end
+function fs.remove(path)
+    if type(delfile) ~= "function" or not fs.exists(path) then return false end
+    return (pcall(delfile, path))
+end
+function fs.list(path)
+    if type(listfiles) ~= "function" or not fs.isdir(path) then return {} end
+    local ok, files = pcall(listfiles, path)
+    if not ok or type(files) ~= "table" then return {} end
+    local out = {}
+    for _, file in ipairs(files) do out[#out + 1] = (string.gsub(tostring(file), "\\", "/")) end
+    table.sort(out)
+    return out
+end
+function fs.readJson(path)
+    local data = fs.read(path)
+    if not data or data == "" then return nil end
+    local ok, value = pcall(S.HttpService.JSONDecode, S.HttpService, data)
+    return ok and value or nil
+end
+function fs.writeJson(path, value)
+    local ok, data = pcall(S.HttpService.JSONEncode, S.HttpService, value)
+    return ok and fs.write(path, data) or false
+end
+G.fs = fs
+
+local util = {}
+function util.clamp01(x) return x < 0 and 0 or (x > 1 and 1 or x) end
+function util.lerp(a, b, t) return a + (b - a) * t end
+function util.round(x, step)
+    step = step or 1
+    return math.floor(x / step + 0.5) * step
+end
+function util.hex(text)
+    text = string.gsub(text, "#", "")
+    return Color3.fromRGB(
+        tonumber(string.sub(text, 1, 2), 16),
+        tonumber(string.sub(text, 3, 4), 16),
+        tonumber(string.sub(text, 5, 6), 16)
+    )
+end
+function util.toHex(color)
+    return string.format("%02X%02X%02X",
+        math.floor(color.R * 255 + 0.5),
+        math.floor(color.G * 255 + 0.5),
+        math.floor(color.B * 255 + 0.5))
+end
+function util.luma(color) return 0.2126 * color.R + 0.7152 * color.G + 0.0722 * color.B end
+function util.format(value, decimals)
+    if decimals and decimals > 0 then return string.format("%." .. decimals .. "f", value) end
+    return tostring(math.floor(value + 0.5))
+end
+function util.comma(n)
+    local text = tostring(math.floor(n))
+    local out = string.reverse((string.gsub(string.reverse(text), "(%d%d%d)", "%1,")))
+    return (string.gsub(out, "^,", ""))
+end
+function util.copy(value)
+    if type(value) ~= "table" then return value end
+    local out = {}
+    for k, v in pairs(value) do out[k] = util.copy(v) end
+    return out
+end
+function util.keys(t)
+    local out = {}
+    for k in pairs(t) do out[#out + 1] = k end
+    return out
+end
+function util.fuzzy(query, text)
+    query, text = string.lower(query), string.lower(text)
+    if query == "" then return 0 end
+    local score, at, run = 0, 1, 0
+    for i = 1, #query do
+        local ch = string.sub(query, i, i)
+        local found = string.find(text, ch, at, true)
+        if not found then return nil end
+        if found == at then run += 1; score += 2 + run else run = 0 end
+        if found == 1 or string.find(string.sub(text, found - 1, found - 1), "[%s%p]") then score += 3 end
+        score -= (found - at) * 0.05
+        at = found + 1
+    end
+    return score - #text * 0.01
+end
+function util.debounce(seconds, fn)
+    local token = 0
+    return function(...)
+        token += 1
+        local mine = token
+        local args = table.pack(...)
+        task.delay(seconds, function()
+            if mine == token and G.alive then G.try("debounce", fn, table.unpack(args, 1, args.n)) end
+        end)
+    end
+end
+function util.randomName()
+    local chars = {}
+    for i = 1, 12 do chars[i] = string.char(math.random(97, 122)) end
+    return table.concat(chars)
+end
+local RAY_REACH = 14000
+function util.ray(from, to, params, lengths)
+    local offset = to - from
+    local distance = offset.Magnitude
+    if distance <= RAY_REACH then return workspace:Raycast(from, offset, params) end
+    local unit = offset / distance
+    local at = 0
+    for _ = 1, lengths or 8 do
+        local reach = math.min(RAY_REACH, distance - at)
+        local hit = workspace:Raycast(from + unit * at, unit * reach, params)
+        if hit then return hit end
+        at += reach
+        if at >= distance - 0.01 then break end
+    end
+    return nil
+end
+function util.studs(distance)
+    if distance >= 99.95e6 then return string.format("%.0fM", distance / 1e6) end
+    if distance >= 999500 then return string.format("%.1fM", distance / 1e6) end
+    if distance >= 99950 then return string.format("%.0fk", distance / 1000) end
+    if distance >= 9995 then return string.format("%.1fk", distance / 1000) end
+    return util.comma(distance + 0.5)
+end
+G.util = util
+
+function G.viewport()
+    local camera = workspace.CurrentCamera
+    return camera and camera.ViewportSize or Vector2.new(1920, 1080)
+end
+function G.clipboard(text)
+    local set = (type(setclipboard) == "function" and setclipboard) or (type(toclipboard) == "function" and toclipboard)
+    if not set then return false end
+    return (pcall(set, tostring(text)))
+end
+G.executor = "Unknown"
+pcall(function()
+    if type(identifyexecutor) == "function" then G.executor = tostring((identifyexecutor())) end
+end)
+G.touch = false
+pcall(function() G.touch = S.UserInputService.TouchEnabled and not S.UserInputService.MouseEnabled end)
+
+function G.host()
+    if G._host and G._host.Parent then return G._host end
+    local host
+    if type(gethui) == "function" then
+        local ok, hidden = pcall(gethui)
+        if ok and typeof(hidden) == "Instance" then host = hidden end
+    end
+    if not host then
+        local ok, core = pcall(function() return cloneref(game:GetService("CoreGui")) end)
+        if ok and core and pcall(function() return core.Name end) then host = core end
+    end
+    if not host and G.LP then host = G.LP:FindFirstChildOfClass("PlayerGui") or G.LP:WaitForChild("PlayerGui", 5) end
+    G._host = host
+    return host
+end
+function G.screen(order, name)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = name or ("OBLITSO_" .. util.randomName())
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = order or 9000
+    pcall(function() gui.ScreenInsets = Enum.ScreenInsets.None end)
+    pcall(function() gui.ClipToDeviceSafeArea = false end)
+    gui.Parent = G.host()
+    return G.own(gui)
+end
+end
+
+do -- 01_motion.lua
+-- ============================================================================
+--  01 motion   one render loop: analytic springs, timelines, jobs
+-- ============================================================================
+local S, util = G.S, G.util
+local Motion = { speed = 1, reduced = false, frame = 0, dt = 1 / 60, smoothDt = 1 / 60, now = os.clock() }
+G.Motion = Motion
+
+Motion.presets = {
+    quick  = { 0.16, 0 },
+    snappy = { 0.24, 0.10 },
+    smooth = { 0.34, 0 },
+    gentle = { 0.52, 0 },
+    bouncy = { 0.40, 0.24 },
+    liquid = { 0.46, 0.30 },
+    lazy   = { 0.90, 0 },
+}
+
+local awake = {}
+local stepping = {}
+local jobs = {}
+local tweens = {}
+
+local Spring = {}
+Spring.__index = Spring
+
+local function tune(spring, preset)
+    local p = type(preset) == "table" and preset or Motion.presets[preset or "smooth"] or Motion.presets.smooth
+    local duration, bounce = p[1], p[2] or 0
+    if Motion.reduced then duration, bounce = duration * 0.55, 0 end
+    duration = math.max(duration / Motion.speed, 0.02)
+    spring.w0 = 2 * math.pi / duration
+    spring.zeta = math.clamp(1 - bounce, 0.08, 1)
+end
+
+function Motion.spring(n, preset, onStep, eps)
+    local spring = setmetatable({ n = n, x = table.create(n, 0), v = table.create(n, 0), g = table.create(n, 0),
+        onStep = onStep, eps = eps or 0.001 }, Spring)
+    tune(spring, preset)
+    return spring
+end
+function Spring:snap(values)
+    for i = 1, self.n do self.x[i], self.g[i], self.v[i] = values[i], values[i], 0 end
+    awake[self] = nil
+    if self.onStep then self.onStep(self.x) end
+end
+function Spring:to(values, preset)
+    if preset then tune(self, preset) end
+    local g = self.g
+    for i = 1, self.n do g[i] = values[i] end
+    awake[self] = true
+end
+function Spring:impulse(index, velocity)
+    self.v[index] += velocity
+    awake[self] = true
+end
+function Spring:moving() return awake[self] == true end
+function Spring:stop() awake[self] = nil end
+
+local function stepSpring(spring, dt)
+    local w0, zeta, eps = spring.w0, spring.zeta, spring.eps
+    local x, v, g = spring.x, spring.v, spring.g
+    local rest = true
+    if zeta < 0.999 then
+        local wd = w0 * math.sqrt(1 - zeta * zeta)
+        local decay = math.exp(-zeta * w0 * dt)
+        local c, s = math.cos(wd * dt), math.sin(wd * dt)
+        for i = 1, spring.n do
+            local a = x[i] - g[i]
+            local b = (v[i] + zeta * w0 * a) / wd
+            local y = decay * (a * c + b * s)
+            local nv = decay * ((b * wd - a * zeta * w0) * c - (a * wd + b * zeta * w0) * s)
+            x[i], v[i] = g[i] + y, nv
+            local tolerance = type(eps) == "table" and eps[i] or eps
+            if rest and (math.abs(y) > tolerance or math.abs(nv) > tolerance * 20) then rest = false end
+        end
+    else
+        local decay = math.exp(-w0 * dt)
+        for i = 1, spring.n do
+            local a = x[i] - g[i]
+            local k = v[i] + w0 * a
+            local y = decay * (a + k * dt)
+            local nv = decay * (v[i] - k * w0 * dt)
+            x[i], v[i] = g[i] + y, nv
+            local tolerance = type(eps) == "table" and eps[i] or eps
+            if rest and (math.abs(y) > tolerance or math.abs(nv) > tolerance * 20) then rest = false end
+        end
+    end
+    if rest then
+        for i = 1, spring.n do x[i], v[i] = g[i], 0 end
+        awake[spring] = nil
+    end
+    if spring.onStep then spring.onStep(x) end
+    if rest and spring.onRest then
+        local done = spring.onRest
+        spring.onRest = nil
+        done()
+    end
+end
+
+local PX, UNIT = 0.08, 0.0008
+local packers = {
+    number = { 1, function(value) return { value } end, function(x) return x[1] end, UNIT },
+    UDim2 = { 4, function(value) return { value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset } end,
+        function(x) return UDim2.new(x[1], x[2], x[3], x[4]) end, { UNIT, PX, UNIT, PX } },
+    UDim = { 2, function(value) return { value.Scale, value.Offset } end, function(x) return UDim.new(x[1], x[2]) end, { UNIT, PX } },
+    Vector2 = { 2, function(value) return { value.X, value.Y } end, function(x) return Vector2.new(x[1], x[2]) end, UNIT },
+    Vector3 = { 3, function(value) return { value.X, value.Y, value.Z } end, function(x) return Vector3.new(x[1], x[2], x[3]) end, UNIT },
+    Color3 = { 3, function(value) return { value.R, value.G, value.B } end,
+        function(x) return Color3.new(util.clamp01(x[1]), util.clamp01(x[2]), util.clamp01(x[3])) end, 0.002 },
+}
+local unitProps = { BackgroundTransparency = true, TextTransparency = true, ImageTransparency = true, Transparency = true,
+    GroupTransparency = true, TextStrokeTransparency = true, ScrollBarImageTransparency = true, FillTransparency = true,
+    OutlineTransparency = true }
+
+local bound = setmetatable({}, { __mode = "k" })
+local function sweepBound()
+    for instance in pairs(bound) do
+        if instance.Parent == nil then
+            local map = bound[instance]
+            for _, spring in pairs(map) do spring:stop() end
+            bound[instance] = nil
+        end
+    end
+end
+
+function Motion.to(instance, property, target, preset, done)
+    local packer = packers[typeof(target)]
+    if not packer then instance[property] = target; if done then done() end; return nil end
+    local map = bound[instance]
+    if not map then map = {}; bound[instance] = map end
+    local spring = map[property]
+    if not spring then
+        local unpack, clampUnit = packer[3], unitProps[property]
+        spring = Motion.spring(packer[1], preset, function(x)
+            if instance.Parent == nil then return end
+            local value = unpack(x)
+            if clampUnit then value = util.clamp01(value) end
+            instance[property] = value
+        end, packer[4])
+        local current = packer[2](instance[property])
+        for i = 1, spring.n do spring.x[i], spring.g[i] = current[i], current[i] end
+        map[property] = spring
+    end
+    spring.onRest = done
+    spring:to(packer[2](target), preset)
+    return spring
+end
+function Motion.snap(instance, property, value)
+    local map = bound[instance]
+    local spring = map and map[property]
+    local packer = packers[typeof(value)]
+    if spring and packer then
+        spring.onRest = nil
+        spring:snap(packer[2](value))
+    else
+        instance[property] = value
+    end
+end
+function Motion.kick(instance, property, index, velocity)
+    local map = bound[instance]
+    local spring = map and map[property]
+    if spring then spring:impulse(index or 1, velocity) end
+end
+
+local ease = {}
+function ease.linear(t) return t end
+function ease.outCubic(t) return 1 - (1 - t) ^ 3 end
+function ease.inCubic(t) return t * t * t end
+function ease.inOutCubic(t) return t < 0.5 and 4 * t * t * t or 1 - (-2 * t + 2) ^ 3 / 2 end
+function ease.outQuint(t) return 1 - (1 - t) ^ 5 end
+function ease.inOutQuint(t) return t < 0.5 and 16 * t ^ 5 or 1 - (-2 * t + 2) ^ 5 / 2 end
+function ease.outExpo(t) return t >= 1 and 1 or 1 - 2 ^ (-10 * t) end
+function ease.inExpo(t) return t <= 0 and 0 or 2 ^ (10 * t - 10) end
+function ease.outBack(t) local c = 1.70158; return 1 + (c + 1) * (t - 1) ^ 3 + c * (t - 1) ^ 2 end
+function ease.outSine(t) return math.sin(t * math.pi / 2) end
+Motion.ease = ease
+function Motion.window(t, from, length, curve)
+    local p = util.clamp01((t - from) / length)
+    return curve and curve(p) or p
+end
+
+function Motion.tween(duration, curve, step, done)
+    local tween = { t = 0, duration = math.max(duration / Motion.speed, 0.001), curve = curve or ease.outCubic, step = step, done = done }
+    if Motion.reduced then tween.duration *= 0.5 end
+    tweens[#tweens + 1] = tween
+    function tween.cancel() tween.dead = true end
+    step(tween.curve(0))
+    return tween
+end
+
+function Motion.every(fn, hz, scope)
+    local job = { fn = fn, interval = hz and 1 / hz or 0, acc = 0, scope = scope or "job" }
+    jobs[#jobs + 1] = job
+    function job.cancel() job.dead = true end
+    return job
+end
+function Motion.after(seconds, fn, scope)
+    local job
+    local left = seconds
+    job = Motion.every(function(dt)
+        left -= dt
+        if left <= 0 then job.dead = true; fn() end
+    end, nil, scope or "after")
+    return job
+end
+
+Motion.stats = { springs = 0, jobs = 0, ms = 0 }
+local function frame(dt)
+    if not G.alive then return end
+    local started = os.clock()
+    dt = math.min(dt, 0.1)
+    Motion.frame += 1
+    Motion.dt = dt
+    Motion.smoothDt += (dt - Motion.smoothDt) * 0.08
+    Motion.now = started
+
+    local springCount = 0
+    for spring in pairs(awake) do
+        springCount += 1
+        stepping[springCount] = spring
+    end
+    for index = 1, springCount do
+        local spring = stepping[index]
+        stepping[index] = nil
+        if awake[spring] then
+            local ok, err = pcall(stepSpring, spring, dt)
+            if not ok then awake[spring] = nil; G.fault("spring", err) end
+        end
+    end
+
+    local count = #tweens
+    if count > 0 then
+        for index = count, 1, -1 do
+            local tween = tweens[index]
+            if tween.dead then
+                table.remove(tweens, index)
+            else
+                tween.t += dt
+                local p = util.clamp01(tween.t / tween.duration)
+                local ok, err = pcall(tween.step, tween.curve(p))
+                if not ok then tween.dead = true; G.fault("tween", err) end
+                if p >= 1 and not tween.dead then
+                    tween.dead = true
+                    table.remove(tweens, index)
+                    if tween.done then G.try("tween.done", tween.done) end
+                end
+            end
+        end
+    end
+
+    count = #jobs
+    if count > 0 then
+        for index = 1, count do
+            local job = jobs[index]
+            if job and not job.dead then
+                local elapsed = dt
+                local run = true
+                if job.interval > 0 then
+                    job.acc += dt
+                    if job.acc < job.interval then run = false else elapsed = math.min(job.acc, 0.5); job.acc = 0 end
+                end
+                if run then
+                    local ok, err = pcall(job.fn, elapsed)
+                    if not ok then job.dead = true; G.fault(job.scope, err) end
+                end
+            end
+        end
+        for index = #jobs, 1, -1 do
+            if jobs[index].dead then table.remove(jobs, index) end
+        end
+    end
+    local stats = Motion.stats
+    stats.springs, stats.jobs, stats.ms = springCount, #jobs, (os.clock() - started) * 1000
+end
+G.own(S.RunService.RenderStepped:Connect(frame))
+Motion._frame = frame
+Motion.every(sweepBound, 1, "motion.sweep")
+end
+
+do -- 02_theme.lua
+-- ============================================================================
+--  02 theme    tokens, live bindings
+-- ============================================================================
+local util = G.util
+local hex = util.hex
+local Theme = { changed = G.Signal.new() }
+G.Theme = Theme
+local T = {}
+G.T = T
+
+Theme.schemes = {
+    oblitos = {
+        label = "Oblitso",
+        base = hex("0E0E12"), ink = hex("F5F4EF"), sub = hex("A9A8B4"), faint = hex("6C6B77"),
+        shadow = 0.42, fill = { 0.045, 0.075, 0.115 }, stroke = { 0.085, 0.16 }, dark = true,
+    },
+    graphite = {
+        label = "Graphite",
+        base = hex("0B0B0F"), ink = hex("F5F4EF"), sub = hex("A9A8B4"), faint = hex("6C6B77"),
+        shadow = 0.42, fill = { 0.045, 0.075, 0.115 }, stroke = { 0.085, 0.16 }, dark = true,
+    },
+    midnight = {
+        label = "Midnight",
+        base = hex("000000"), ink = hex("F5F4EF"), sub = hex("9E9DA9"), faint = hex("62616C"),
+        shadow = 0.3, fill = { 0.055, 0.09, 0.13 }, stroke = { 0.10, 0.18 }, dark = true,
+    },
+    porcelain = {
+        label = "Porcelain",
+        base = hex("F3F2EE"), ink = hex("121216"), sub = hex("56555F"), faint = hex("8C8B95"),
+        shadow = 0.72, fill = { 0.05, 0.08, 0.12 }, stroke = { 0.10, 0.18 }, dark = false,
+    },
+}
+Theme.schemeOrder = { "oblitos", "graphite", "midnight", "porcelain" }
+Theme.accents = {
+    { id = "greenglass", label = "Green", color = hex("00A86B") },
+    { id = "ultraviolet", label = "Ultraviolet", color = hex("8E7DFF") },
+    { id = "azure", label = "Azure", color = hex("4DA3FF") },
+    { id = "mint", label = "Mint", color = hex("45DDA8") },
+    { id = "ember", label = "Ember", color = hex("FF7A45") },
+    { id = "rose", label = "Rose", color = hex("FF5C93") },
+    { id = "gold", label = "Gold", color = hex("F2C14E") },
+    { id = "blood", label = "Blood", color = hex("FF4B4B") },
+    { id = "bone", label = "Bone", color = hex("EDEBE4") },
+}
+
+local function accentOf(id)
+    for _, accent in ipairs(Theme.accents) do
+        if accent.id == id then return accent.color end
+    end
+    return Theme.accents[1].color
+end
+Theme.accentOf = accentOf
+
+Theme.state = {
+    scheme = OBLITSO_CONFIG.Scheme or "oblitos",
+    accent = accentOf(OBLITSO_CONFIG.Accent or "greenglass"),
+    glass  = (OBLITSO_CONFIG.Glass or 60) / 100,
+    radius = 1,
+    blur   = false,
+}
+
+Theme.type = {
+    display = { "serifItalic", 34 },
+    title = { "serif", 25 },
+    heading = { "text600", 15 },
+    label = { "text500", 14 },
+    body = { "text400", 13 },
+    caption = { "text400", 12 },
+    eyebrow = { "wideBold", 10 },
+    mono = { "mono400", 12 },
+    monoBold = { "mono500", 12 },
+    button = { "text600", 13 },
+    brand = { "wideBlack", 18 },
+}
+
+local function resolve()
+    local state = Theme.state
+    local scheme = Theme.schemes[state.scheme] or Theme.schemes.oblitos
+    local glass = util.clamp01(state.glass)
+    T.dark = scheme.dark
+    T.base, T.ink, T.sub, T.faint = scheme.base, scheme.ink, scheme.sub, scheme.faint
+    local alpha = state.blur and util.lerp(0.5, 0.94, glass) or util.lerp(0.84, 0.975, glass)
+    T.baseA = 1 - alpha
+    T.panelA = 1 - util.lerp(0.34, 0.62, glass)
+    T.fill1A, T.fill2A, T.fill3A = 1 - scheme.fill[1], 1 - scheme.fill[2], 1 - scheme.fill[3]
+    T.strokeA, T.stroke2A = 1 - scheme.stroke[1], 1 - scheme.stroke[2]
+    T.shadowA = scheme.shadow
+    T.accent = state.accent
+    T.accentInk = util.luma(state.accent) > 0.62 and hex("101014") or hex("FFFFFF")
+    T.accentDim = state.accent:Lerp(scheme.base, 0.55)
+    T.ok, T.warn, T.bad = hex("52D6A0"), hex("F4B45F"), hex("FF6577")
+    T.white, T.black = Color3.new(1, 1, 1), Color3.new(0, 0, 0)
+    T.rimA = scheme.dark and 0.5 or 0.1
+    T.popover = scheme.base:Lerp(scheme.ink, scheme.dark and 0.07 or 0.0)
+    local r = state.radius
+    T.rWindow  = math.floor(26 * r)
+    T.rPanel   = math.floor(19 * r)
+    T.rCard    = math.floor(16 * r)
+    T.rControl = math.floor(11 * r)
+    T.rSmall   = math.floor(7 * r)
+end
+resolve()
+
+local bindings = {}
+local boundAt = {}
+function Theme.bind(instance, property, key, map)
+    local list = bindings[instance]
+    if not list then list = {}; bindings[instance] = list; boundAt[instance] = os.clock() end
+    list[property] = { key, map }
+    local value = T[key]
+    if map then value = map(value, T) end
+    instance[property] = value
+    return instance
+end
+function Theme.unbind(instance, property)
+    local list = bindings[instance]
+    if list then list[property] = nil end
+end
+function Theme.sweep()
+    local now = os.clock()
+    for instance in pairs(bindings) do
+        if instance.Parent == nil and now - boundAt[instance] > 5 then
+            bindings[instance], boundAt[instance] = nil, nil
+        end
+    end
+end
+function Theme.apply()
+    resolve()
+    Theme.sweep()
+    for instance, list in pairs(bindings) do
+        for property, binding in pairs(list) do
+            local value = T[binding[1]]
+            if binding[2] then value = binding[2](value, T) end
+            pcall(function() instance[property] = value end)
+        end
+    end
+    Theme.changed:fire()
+end
+G.Motion.every(Theme.sweep, 1 / 20, "theme.sweep")
+function Theme.set(changes)
+    local state = Theme.state
+    for key, value in pairs(changes) do state[key] = value end
+    Theme.apply()
+end
+function Theme.corner(key) return UDim.new(0, T[key] or 10) end
+end
+
+do -- 03_assets.lua
+-- ============================================================================
+--  03 assets   fonts, images, sounds fetched from GitLab into local cache
+--  Raw binaries for now: HttpGet returns bytes, writefile writes them, then
+--  getcustomasset gives us an rbxasset:// URL to hand to Roblox. If bytes
+--  corrupt in transit, switch to .b64 and decode with crypt.base64decode.
+-- ============================================================================
+local S, fs, util = G.S, G.fs, G.util
+local Assets = { ready = false, lite = true, calls = 0, family = {}, urls = {} }
+G.Assets = Assets
+
+local SCRIPT_SLUG = (string.gsub(tostring(OBLITSO_CONFIG.ScriptName or "OBLITSO"), "%W", "_"))
+local ASSET_ROOT  = (OBLITSO_CONFIG.SaveFolder or "OBLGUI") .. "/" .. SCRIPT_SLUG .. "/Assets"
+local ASSET_BASE  = OBLITSO_CONFIG.AssetBase or ""
+
+Assets.root = ASSET_ROOT
+Assets.base = ASSET_BASE
+Assets.slug = SCRIPT_SLUG
+
+for _, sub in ipairs({ "fonts", "images", "sounds" }) do
+    pcall(fs.mkdir, ASSET_ROOT .. "/" .. sub)
+end
+
+Assets.manifest = {
+    fonts = {
+        "fonts/Inter-Regular.ttf",
+        "fonts/Inter-Medium.ttf",
+        "fonts/Inter-SemiBold.ttf",
+        "fonts/Inter-Bold.ttf",
+        "fonts/GeistMono-Regular.ttf",
+        "fonts/GeistMono-Medium.ttf",
+        "fonts/InstrumentSerif-Regular.ttf",
+        "fonts/InstrumentSerif-Italic.ttf",
+        "fonts/Archivo-ExpandedBold.ttf",
+        "fonts/Archivo-ExpandedBlack.ttf",
+    },
+    images = {
+        "images/wordmark.png",
+        "images/grain.png",
+        "images/icon-atlas.png",
+    },
+    sounds = {
+        "sounds/bh_click.ogg",
+        "sounds/bh_hover.ogg",
+        "sounds/bh_tab.ogg",
+        "sounds/bh_toggle_on.ogg",
+        "sounds/bh_toggle_off.ogg",
+        "sounds/bh_hit_pop.ogg",
+    },
+}
+
+local fetched = {}
+function Assets.fetch(relative)
+    if fetched[relative] ~= nil then return fetched[relative] end
+    local local_path = ASSET_ROOT .. "/" .. relative
+    if fs.exists(local_path) then
+        fetched[relative] = local_path
+        return local_path
+    end
+    if not ASSET_BASE or ASSET_BASE == "" then
+        fetched[relative] = false
+        return nil
+    end
+    local url = ASSET_BASE .. "/" .. relative
+    local ok, data = pcall(function() return game:HttpGet(url) end)
+    if not ok or type(data) ~= "string" or #data < 16 then
+        warn("[OBLITSO] asset fetch failed: " .. relative .. " (" .. tostring(ok and (#data or "nil") or data) .. ")")
+        fetched[relative] = false
+        return nil
+    end
+    local dir = string.match(local_path, "^(.*)/[^/]+$")
+    if dir and not fs.isdir(dir) then fs.mkdir(dir) end
+    if not fs.write(local_path, data) then
+        warn("[OBLITSO] asset write failed: " .. relative)
+        fetched[relative] = false
+        return nil
+    end
+    fetched[relative] = local_path
+    return local_path
+end
+
+function Assets.resolve(relative)
+    local path = Assets.fetch(relative)
+    if not path then return nil end
+    if Assets.urls[path] ~= nil then return Assets.urls[path] or nil end
+    local ok, url = pcall(getcustomasset, path)
+    if ok and type(url) == "string" and #url > 0 then
+        Assets.urls[path] = url
+        return url
+    end
+    Assets.urls[path] = false
+    return nil
+end
+
+-- ---------- fonts ----------
+local FAMILIES = {
+    Inter = {
+        { face = "Regular",  weight = 400, style = "normal", file = "fonts/Inter-Regular.ttf" },
+        { face = "Medium",   weight = 500, style = "normal", file = "fonts/Inter-Medium.ttf" },
+        { face = "SemiBold", weight = 600, style = "normal", file = "fonts/Inter-SemiBold.ttf" },
+        { face = "Bold",     weight = 700, style = "normal", file = "fonts/Inter-Bold.ttf" },
+    },
+    GeistMono = {
+        { face = "Regular", weight = 400, style = "normal", file = "fonts/GeistMono-Regular.ttf" },
+        { face = "Medium",  weight = 500, style = "normal", file = "fonts/GeistMono-Medium.ttf" },
+    },
+    InstrumentSerif = {
+        { face = "Regular", weight = 400, style = "normal", file = "fonts/InstrumentSerif-Regular.ttf" },
+        { face = "Italic",  weight = 400, style = "italic", file = "fonts/InstrumentSerif-Italic.ttf" },
+    },
+    ArchivoExpanded = {
+        { face = "Bold",  weight = 700, style = "normal", file = "fonts/Archivo-ExpandedBold.ttf" },
+        { face = "Black", weight = 900, style = "normal", file = "fonts/Archivo-ExpandedBlack.ttf" },
+    },
+}
+
+local function buildFamilyJson(name, faces)
+    local parts = {}
+    for _, f in ipairs(faces) do
+        parts[#parts + 1] = string.format(
+            '{"name":"%s","weight":%d,"style":"%s","assetId":"%s"}',
+            f.face, f.weight, f.style, f.url)
+    end
+    return string.format('{"name":"%s","faces":[%s]}', name, table.concat(parts, ","))
+end
+
+local function builtin(name, weight, style)
+    local ok, font = pcall(Font.fromName, name, weight or Enum.FontWeight.Regular, style or Enum.FontStyle.Normal)
+    if ok and font then return font end
+    return Font.fromEnum(Enum.Font.Gotham)
+end
+local FALLBACK = {
+    text400    = function() return builtin("BuilderSans", Enum.FontWeight.Regular) end,
+    text500    = function() return builtin("BuilderSans", Enum.FontWeight.Medium) end,
+    text600    = function() return builtin("BuilderSans", Enum.FontWeight.SemiBold) end,
+    text700    = function() return builtin("BuilderSans", Enum.FontWeight.Bold) end,
+    mono400    = function() return builtin("RobotoMono", Enum.FontWeight.Regular) end,
+    mono500    = function() return builtin("RobotoMono", Enum.FontWeight.Medium) end,
+    serif      = function() return builtin("Merriweather", Enum.FontWeight.Regular) end,
+    serifItalic= function() return builtin("Merriweather", Enum.FontWeight.Regular, Enum.FontStyle.Italic) end,
+    wideBold   = function() return builtin("BuilderExtended", Enum.FontWeight.Bold) end,
+    wideBlack  = function() return builtin("BuilderExtended", Enum.FontWeight.Heavy) end,
+}
+G.F = {}
+
+local KEY_MAP = {
+    text400    = { "Inter", "Regular" },
+    text500    = { "Inter", "Medium" },
+    text600    = { "Inter", "SemiBold" },
+    text700    = { "Inter", "Bold" },
+    mono400    = { "GeistMono", "Regular" },
+    mono500    = { "GeistMono", "Medium" },
+    serif      = { "InstrumentSerif", "Regular" },
+    serifItalic= { "InstrumentSerif", "Italic" },
+    wideBold   = { "ArchivoExpanded", "Bold" },
+    wideBlack  = { "ArchivoExpanded", "Black" },
+}
+
+local function loadFonts()
+    local custom = false
+    if type(Font.new) == "function" then
+        for familyName, faces in pairs(FAMILIES) do
+            local built = {}
+            for _, face in ipairs(faces) do
+                local url = Assets.resolve(face.file)
+                if url then
+                    built[#built + 1] = { face = face.face, weight = face.weight, style = face.style, url = url }
+                end
+            end
+            if #built > 0 then
+                local json = buildFamilyJson(familyName, built)
+                local jsonPath = ASSET_ROOT .. "/fonts/" .. familyName .. ".json"
+                if fs.write(jsonPath, json) then
+                    local ok, jurl = pcall(getcustomasset, jsonPath)
+                    if ok and jurl then
+                        Assets.family[familyName] = { url = jurl }
+                    end
+                end
+            end
+        end
+        for key, spec in pairs(KEY_MAP) do
+            local family = Assets.family[spec[1]]
+            if family then
+                local weightName = spec[2]
+                local style = (weightName == "Italic") and Enum.FontStyle.Italic or Enum.FontStyle.Normal
+                local ok, font = pcall(Font.new, family.url,
+                    Enum.FontWeight[weightName] or Enum.FontWeight.Regular, style)
+                if ok and font then
+                    G.F[key] = font
+                    custom = true
+                end
+            end
+        end
+    end
+    for key, make in pairs(FALLBACK) do
+        if not G.F[key] then G.F[key] = make() end
+    end
+    Assets.fontSource = custom and "custom" or "builtin"
+end
+
+-- ---------- images ----------
+local function loadImages()
+    Assets.urls.wordmark = Assets.resolve("images/wordmark.png")
+    Assets.urls.grain    = Assets.resolve("images/grain.png")
+    Assets.urls.atlas    = Assets.resolve(OBLITSO_CONFIG.IconAtlas or "images/icon-atlas.png")
+end
+
+-- ---------- sounds ----------
+local SOUND_FILES = {
+    click      = "sounds/bh_click.ogg",
+    hover      = "sounds/bh_hover.ogg",
+    tab        = "sounds/bh_tab.ogg",
+    toggle_on  = "sounds/bh_toggle_on.ogg",
+    toggle_off = "sounds/bh_toggle_off.ogg",
+    notify     = "sounds/bh_hit_pop.ogg",
+}
+Assets.soundUrls = {}
+
+local function loadSounds()
+    for name, file in pairs(SOUND_FILES) do
+        local url = Assets.resolve(file)
+        if url then Assets.soundUrls[name] = url end
+    end
+end
+
+function Assets.sound(name) return Assets.soundUrls[name] end
+
+-- ---------- icon atlas ----------
+local ATLAS = { cols = 20, cell = 48 }
+Assets.atlas = ATLAS
+function Assets.icon(name)
+    local atlasUrl = Assets.urls.atlas
+    if not atlasUrl then return nil end
+    local index = Assets.ICON_MAP and Assets.ICON_MAP[name]
+    if not index then return nil end
+    return atlasUrl,
+        Vector2.new((index % ATLAS.cols) * ATLAS.cell, math.floor(index / ATLAS.cols) * ATLAS.cell),
+        Vector2.new(ATLAS.cell, ATLAS.cell)
+end
+Assets.ICON_MAP = {
+    ["x"] = 14, ["minus"] = 15, ["plus"] = 16, ["check"] = 17,
+    ["chevron-down"] = 18, ["chevron-up"] = 19, ["chevrons-up-down"] = 22,
+    ["ellipsis"] = 23, ["search"] = 13, ["settings"] = 11,
+    ["house"] = 0, ["palette"] = 25, ["keyboard"] = 26, ["save"] = 28,
+    ["rotate-ccw"] = 34, ["power"] = 35, ["shield"] = 36, ["zap"] = 38,
+    ["sparkles"] = 39, ["eye-off"] = 5, ["eye"] = 4, ["info"] = 80,
+    ["triangle-alert"] = 81, ["circle-check"] = 83, ["circle"] = 84,
+    ["star"] = 85, ["lightbulb"] = 144, ["activity"] = 123, ["camera"] = 70,
+    ["monitor"] = 71, ["film"] = 40, ["clapperboard"] = 41, ["volume-2"] = 42,
+    ["volume-x"] = 43, ["pipette"] = 182, ["refresh-cw"] = 33, ["shuffle"] = 77,
+    ["badge-check"] = 156, ["crosshair"] = 3, ["target"] = 51, ["panel-left"] = 92,
+    ["layers"] = 93, ["box"] = 94, ["package"] = 95,
+}
+
+function Assets.init()
+    loadFonts()
+    loadImages()
+    loadSounds()
+    Assets.lite = not Assets.urls.atlas
+    Assets.ready = true
+    return not Assets.lite
+end
+end
+
+do -- 04_ui.lua
+-- ============================================================================
+--  04 ui       instance factory, glass, text, icons, input, popovers, scroll
+-- ============================================================================
+local S, util, Motion, Theme, T, Assets = G.S, G.util, G.Motion, G.Theme, G.T, G.Assets
+local UIS = S.UserInputService
+local UI = { fx = { canvas = true, shadow = false, innerStroke = false }, sfxVolume = 0.5, sfxOn = true }
+G.UI = UI
+
+pcall(function()
+    local probe = Instance.new("UIShadow")
+    probe.BlurRadius = UDim.new(0, 4)
+    probe:Destroy()
+    UI.fx.shadow = true
+end)
+pcall(function()
+    local probe = Instance.new("UIStroke")
+    probe.BorderStrokePosition = Enum.BorderStrokePosition.Inner
+    probe:Destroy()
+    UI.fx.innerStroke = true
+end)
+pcall(function()
+    local saved = UserSettings():GetService("UserGameSettings").SavedQualityLevel
+    if saved ~= Enum.SavedQualitySetting.Automatic and saved.Value <= 2 then UI.fx.canvas = false end
+end)
+
+local function applyTheme(instance, map)
+    for property, spec in pairs(map) do
+        if type(spec) == "table" then Theme.bind(instance, property, spec[1], spec[2]) else Theme.bind(instance, property, spec) end
+    end
+end
+function UI.new(class, props, children)
+    local instance = Instance.new(class)
+    local parent
+    if props then
+        for key, value in pairs(props) do
+            if key == "Parent" then parent = value
+            elseif key == "Theme" then applyTheme(instance, value)
+            else instance[key] = value end
+        end
+    end
+    if children then
+        for _, child in ipairs(children) do child.Parent = instance end
+    end
+    if parent then instance.Parent = parent end
+    return instance
+end
+
+function UI.frame(parent, props)
+    local frame = Instance.new("Frame")
+    frame.BackgroundTransparency = 1
+    frame.BorderSizePixel = 0
+    if props then
+        for key, value in pairs(props) do
+            if key == "Theme" then applyTheme(frame, value) else frame[key] = value end
+        end
+    end
+    frame.Parent = parent
+    return frame
+end
+function UI.corner(instance, radius)
+    local corner = Instance.new("UICorner")
+    if radius == true then corner.CornerRadius = UDim.new(1, 0)
+    elseif type(radius) == "string" then Theme.bind(corner, "CornerRadius", radius, function(value) return UDim.new(0, value) end)
+    else corner.CornerRadius = UDim.new(0, radius or 8) end
+    corner.Parent = instance
+    return corner
+end
+function UI.stroke(instance, token, alphaToken, thickness)
+    local stroke = Instance.new("UIStroke")
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Thickness = thickness or 1
+    Theme.bind(stroke, "Color", token or "ink")
+    if type(alphaToken) == "number" then stroke.Transparency = alphaToken else Theme.bind(stroke, "Transparency", alphaToken or "strokeA") end
+    if UI.fx.innerStroke then stroke.BorderStrokePosition = Enum.BorderStrokePosition.Inner end
+    stroke.Parent = instance
+    return stroke
+end
+function UI.pad(instance, top, right, bottom, left)
+    local pad = Instance.new("UIPadding")
+    right = right or top
+    bottom = bottom or top
+    left = left or right
+    pad.PaddingTop, pad.PaddingRight, pad.PaddingBottom, pad.PaddingLeft =
+        UDim.new(0, top), UDim.new(0, right), UDim.new(0, bottom), UDim.new(0, left)
+    pad.Parent = instance
+    return pad
+end
+function UI.list(instance, direction, gap, align)
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = direction == "x" and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
+    layout.Padding = UDim.new(0, gap or 0)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    if align then
+        if align.h then layout.HorizontalAlignment = Enum.HorizontalAlignment[align.h] end
+        if align.v then layout.VerticalAlignment = Enum.VerticalAlignment[align.v] end
+    end
+    layout.Parent = instance
+    return layout
+end
+function UI.scaleOf(instance)
+    local scale = instance:FindFirstChildOfClass("UIScale")
+    if not scale then scale = Instance.new("UIScale"); scale.Parent = instance end
+    return scale
+end
+function UI.gradient(instance, props)
+    local gradient = Instance.new("UIGradient")
+    for key, value in pairs(props) do gradient[key] = value end
+    gradient.Parent = instance
+    return gradient
+end
+function UI.alphaSeq(...)
+    local points, args = {}, { ... }
+    for i = 1, #args, 2 do points[#points + 1] = NumberSequenceKeypoint.new(args[i], args[i + 1]) end
+    return NumberSequence.new(points)
+end
+
+local STYLE = Theme.type
+function UI.text(parent, text, style, color, props)
+    local spec = STYLE[style or "body"] or STYLE.body
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.BorderSizePixel = 0
+    label.FontFace = G.F[spec[1]]
+    label.TextSize = spec[2]
+    label.Text = text or ""
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.AutomaticSize = Enum.AutomaticSize.XY
+    label.Size = UDim2.new()
+    if typeof(color) == "Color3" then label.TextColor3 = color else Theme.bind(label, "TextColor3", color or "ink") end
+    if props then
+        for key, value in pairs(props) do label[key] = value end
+    end
+    label.Parent = parent
+    return label
+end
+
+local ICON_GLYPH = {
+    ["x"] = "x", ["minus"] = "-", ["plus"] = "+", ["check"] = "v",
+    ["chevron-down"] = "v", ["chevron-up"] = "^", ["chevrons-up-down"] = "<>",
+    ["ellipsis"] = "...", ["search"] = "?", ["settings"] = "*",
+    ["house"] = "H", ["palette"] = "#", ["keyboard"] = "K", ["save"] = "S",
+    ["rotate-ccw"] = "<", ["power"] = "O", ["shield"] = "S", ["zap"] = "!",
+    ["sparkles"] = "*", ["eye-off"] = "-", ["eye"] = "o", ["info"] = "i",
+    ["triangle-alert"] = "!", ["circle-check"] = "v", ["circle"] = "o",
+    ["star"] = "*", ["lightbulb"] = "?", ["activity"] = "~",
+    ["camera"] = "C", ["monitor"] = "M", ["film"] = "F", ["clapperboard"] = "C",
+    ["volume-2"] = ">", ["volume-x"] = "x", ["pipette"] = "/",
+    ["refresh-cw"] = "R", ["shuffle"] = "~", ["badge-check"] = "v",
+    ["crosshair"] = "+", ["target"] = "+", ["panel-left"] = "|",
+    ["layers"] = "=", ["box"] = "[]", ["package"] = "{}",
+}
+
+function UI.icon(parent, name, size, color, props)
+    local image = Instance.new("ImageLabel")
+    image.BackgroundTransparency = 1
+    image.BorderSizePixel = 0
+    image.Size = UDim2.fromOffset(size or 18, size or 18)
+    image.ScaleType = Enum.ScaleType.Fit
+    if typeof(color) == "Color3" then image.ImageColor3 = color else Theme.bind(image, "ImageColor3", color or "ink") end
+    local id, offset, rect = Assets.icon(name)
+    if id then
+        image.Image, image.ImageRectOffset, image.ImageRectSize = id, offset, rect
+    else
+        image.Image = ""
+        local glyph = Instance.new("TextLabel")
+        glyph.BackgroundTransparency = 1
+        glyph.BorderSizePixel = 0
+        glyph.Size = UDim2.fromScale(1, 1)
+        glyph.FontFace = G.F.mono500
+        glyph.TextSize = math.max(10, math.floor((size or 18) * 0.72))
+        glyph.TextColor3 = image.ImageColor3
+        glyph.TextXAlignment = Enum.TextXAlignment.Center
+        glyph.TextYAlignment = Enum.TextYAlignment.Center
+        glyph.Text = ICON_GLYPH[name] or "?"
+        glyph.Parent = image
+        image:GetPropertyChangedSignal("ImageColor3"):Connect(function()
+            if glyph.Parent then glyph.TextColor3 = image.ImageColor3 end
+        end)
+    end
+    if props then
+        for key, value in pairs(props) do image[key] = value end
+    end
+    image.Parent = parent
+    return image
+end
+function UI.setIcon(image, name)
+    if not image:IsA("ImageLabel") then return end
+    local id, offset, rect = Assets.icon(name)
+    if id then image.Image, image.ImageRectOffset, image.ImageRectSize = id, offset, rect end
+end
+
+function UI.glass(parent, opts)
+    opts = opts or {}
+    local level = opts.level or "panel"
+    local radius = opts.radius or "rPanel"
+    local frame = Instance.new("Frame")
+    frame.BorderSizePixel = 0
+    frame.Name = opts.name or "Glass"
+    if level == "window" then
+        Theme.bind(frame, "BackgroundColor3", "base")
+        Theme.bind(frame, "BackgroundTransparency", "baseA")
+    elseif level == "popover" then
+        Theme.bind(frame, "BackgroundColor3", "popover")
+        frame.BackgroundTransparency = 0.04
+    else
+        Theme.bind(frame, "BackgroundColor3", "ink")
+        Theme.bind(frame, "BackgroundTransparency", opts.fill or "fill1A")
+    end
+    UI.corner(frame, radius)
+    if opts.sheen ~= false then
+        local sheen = Instance.new("Frame")
+        sheen.Name = "Sheen"
+        sheen.BorderSizePixel = 0
+        sheen.BackgroundColor3 = Color3.new(1, 1, 1)
+        sheen.Size = UDim2.fromScale(1, 1)
+        sheen.ZIndex = 0
+        sheen.Interactable = false
+        UI.corner(sheen, radius)
+        UI.gradient(sheen, { Rotation = 90, Transparency = UI.alphaSeq(0, opts.sheenAlpha or 0.93, 0.45, 1, 1, 1) })
+        sheen.Parent = frame
+    end
+    -- Based Hub grain recipe: 128px tiled image, transparency ~0.955, above
+    -- sheen but below content. Kills the flat-panel look without visible tiling.
+    if opts.grain ~= false and Assets.urls and Assets.urls.grain then
+        local grain = Instance.new("ImageLabel")
+        grain.Name = "Grain"
+        grain.BackgroundTransparency = 1
+        grain.BorderSizePixel = 0
+        grain.Size = UDim2.fromScale(1, 1)
+        grain.Image = Assets.urls.grain
+        grain.ImageTransparency = opts.grainAlpha or 0.955
+        grain.ScaleType = Enum.ScaleType.Tile
+        grain.TileSize = UDim2.fromOffset(128, 128)
+        grain.ZIndex = 1
+        grain.Interactable = false
+        UI.corner(grain, radius)
+        grain.Parent = frame
+    end
+    local rim = Instance.new("UIStroke")
+    rim.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    rim.Thickness = 1
+    rim.Color = Color3.new(1, 1, 1)
+    if UI.fx.innerStroke then rim.BorderStrokePosition = Enum.BorderStrokePosition.Inner end
+    local rimGradient = UI.gradient(rim, { Rotation = 52,
+        Transparency = UI.alphaSeq(0, opts.rimHi or 0.55, 0.32, 0.9, 0.68, 0.93, 1, opts.rimLo or 0.72) })
+    rim.Parent = frame
+    if opts.shadow and UI.fx.shadow then
+        local shadow = Instance.new("UIShadow")
+        shadow.BlurRadius = UDim.new(0, opts.shadow == true and 56 or opts.shadow)
+        shadow.Offset = UDim2.fromOffset(0, opts.shadowY or 22)
+        shadow.Color = Color3.new(0, 0, 0)
+        Theme.bind(shadow, "Transparency", "shadowA")
+        pcall(function() shadow.ShowBehindParent = false end)
+        shadow.Parent = frame
+    end
+    if opts.props then
+        for key, value in pairs(opts.props) do frame[key] = value end
+    end
+    frame.Parent = parent
+    return frame, rimGradient
+end
+
+function UI.surface(parent, props, radius, fill)
+    local frame = Instance.new("Frame")
+    frame.BorderSizePixel = 0
+    Theme.bind(frame, "BackgroundColor3", "ink")
+    Theme.bind(frame, "BackgroundTransparency", fill or "fill1A")
+    UI.corner(frame, radius or "rCard")
+    if props then
+        for key, value in pairs(props) do frame[key] = value end
+    end
+    frame.Parent = parent
+    return frame
+end
+
+function UI.group(parent, props)
+    local group = Instance.new(UI.fx.canvas and "CanvasGroup" or "Frame")
+    group.BackgroundTransparency = 1
+    group.BorderSizePixel = 0
+    if props then
+        for key, value in pairs(props) do group[key] = value end
+    end
+    group.Parent = parent
+    return group
+end
+function UI.fade(group, alpha, preset, done)
+    if group:IsA("CanvasGroup") then
+        if alpha > 0 then group.Visible = true end
+        Motion.to(group, "GroupTransparency", 1 - alpha, preset or "quick", function()
+            if alpha <= 0 then group.Visible = false end
+            if done then done() end
+        end)
+    else
+        group.Visible = alpha > 0
+        if done then done() end
+    end
+end
+function UI.setFade(group, alpha)
+    if group:IsA("CanvasGroup") then Motion.snap(group, "GroupTransparency", 1 - alpha) end
+    group.Visible = alpha > 0
+end
+
+local sounds = {}
+function UI.sfx(name, volume)
+    if not UI.sfxOn or UI.sfxVolume <= 0 or not UI.soundHost then return end
+    local id = Assets.sound(name)
+    if not id then return end
+    local now = os.clock()
+    local entry = sounds[name]
+    if entry and now - entry.at < 0.04 then return end
+    if not entry then
+        local sound = Instance.new("Sound")
+        sound.SoundId = id
+        sound.Parent = UI.soundHost
+        entry = { sound = sound, at = 0 }
+        sounds[name] = entry
+    end
+    entry.at = now
+    entry.sound.Volume = (volume or 1) * UI.sfxVolume * 0.5
+    entry.sound.PlaybackSpeed = 0.97 + math.random() * 0.06
+    entry.sound:Play()
+end
+
+local function isPress(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+end
+UI.isPress = isPress
+function UI.inset() return S.GuiService:GetGuiInset() end
+function UI.mouse() return UIS:GetMouseLocation() - S.GuiService:GetGuiInset() end
+function UI.point(input) return Vector2.new(input.Position.X, input.Position.Y) end
+function UI.unit() return 1 end
+function UI.inside(gui, point)
+    local p, s = gui.AbsolutePosition, gui.AbsoluteSize
+    return point.X >= p.X and point.X <= p.X + s.X and point.Y >= p.Y and point.Y <= p.Y + s.Y
+end
+
+function UI.wire(button, handlers)
+    local pressing = false
+    if handlers.hover then
+        button.MouseEnter:Connect(G.safe("ui.hover", function()
+            UI.sfx("hover", 0.35)
+            handlers.hover(true)
+        end))
+        button.MouseLeave:Connect(G.safe("ui.hover", function()
+            handlers.hover(false)
+            if pressing and handlers.press then pressing = false; handlers.press(false) end
+        end))
+    end
+    button.InputBegan:Connect(G.safe("ui.press", function(input)
+        if isPress(input) then
+            pressing = true
+            if handlers.press then handlers.press(true) end
+        elseif input.UserInputType == Enum.UserInputType.MouseButton2 and handlers.alt then
+            handlers.alt(input)
+        end
+    end))
+    button.InputEnded:Connect(G.safe("ui.press", function(input)
+        if isPress(input) and pressing then
+            pressing = false
+            if handlers.press then handlers.press(false) end
+        end
+    end))
+    if handlers.click then button.Activated:Connect(G.safe("ui.click", function(input) handlers.click(input) end)) end
+    return button
+end
+function UI.button(parent, handlers, props)
+    local button = Instance.new("TextButton")
+    button.Name = "Hit"
+    button.Text = ""
+    button.BackgroundTransparency = 1
+    button.BorderSizePixel = 0
+    button.AutoButtonColor = false
+    button.Size = UDim2.fromScale(1, 1)
+    button.ZIndex = 5
+    if props then
+        for key, value in pairs(props) do button[key] = value end
+    end
+    UI.wire(button, handlers)
+    button.Parent = parent
+    return button
+end
+function UI.pressable(parent, props, handlers)
+    local button = Instance.new("TextButton")
+    button.Text = ""
+    button.AutoButtonColor = false
+    button.BorderSizePixel = 0
+    button.BackgroundTransparency = 1
+    if props then
+        for key, value in pairs(props) do
+            if key == "Theme" then applyTheme(button, value) else button[key] = value end
+        end
+    end
+    if handlers then UI.wire(button, handlers) end
+    button.Parent = parent
+    return button
+end
+
+function UI.drag(handle, onStart, onMove, onEnd)
+    handle.InputBegan:Connect(G.safe("ui.drag", function(input)
+        if not isPress(input) then return end
+        local start = UI.point(input)
+        if onStart and onStart(start) == false then return end
+        local touch = input.UserInputType == Enum.UserInputType.Touch
+        local moved, ended
+        local function finish()
+            if moved then moved:Disconnect() end
+            if ended then ended:Disconnect() end
+            moved, ended = nil, nil
+            if onEnd then G.try("ui.drag.end", onEnd) end
+        end
+        moved = UIS.InputChanged:Connect(G.safe("ui.drag.move", function(change)
+            if (touch and change == input) or (not touch and change.UserInputType == Enum.UserInputType.MouseMovement) then
+                local p = UI.point(change)
+                onMove(p, p - start)
+            end
+        end))
+        ended = UIS.InputEnded:Connect(function(finished)
+            if finished == input or (not touch and finished.UserInputType == Enum.UserInputType.MouseButton1) then finish() end
+        end)
+    end))
+end
+
+local popovers = {}
+local openAnchors = setmetatable({}, { __mode = "k" })
+
+function UI.mountOverlay(gui, scaleSource)
+    UI.overlay = UI.frame(gui, { Name = "Overlay", Size = UDim2.fromScale(1, 1), ZIndex = 50 })
+    UI.overlayScale = scaleSource
+    G.connect(UIS.InputBegan, function(input)
+        if #popovers == 0 then return end
+        if isPress(input) or input.UserInputType == Enum.UserInputType.MouseButton2 then
+            local point = UI.point(input)
+            for index = #popovers, 1, -1 do
+                local pop = popovers[index]
+                if not UI.inside(pop.frame, point) and not (pop.anchor and UI.inside(pop.anchor, point)) then
+                    pop.close()
+                else
+                    break
+                end
+            end
+        elseif input.KeyCode == Enum.KeyCode.Escape then
+            popovers[#popovers].close()
+        end
+    end, "ui.overlay")
+end
+function UI.closePopovers()
+    for index = #popovers, 1, -1 do popovers[index].close(true) end
+end
+function UI.popoverOpen() return #popovers > 0 end
+
+function UI.popover(anchor, opts, build)
+    opts = opts or {}
+    local existing = openAnchors[anchor]
+    if existing and not existing.closed then
+        existing.close()
+        return existing
+    end
+    local scale = UI.overlayScale and UI.overlayScale() or 1
+    local width = opts.width or 220
+    local pop = { anchor = anchor }
+    local holder = UI.frame(UI.overlay, { Name = "Popover", Size = UDim2.fromOffset(width, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, ZIndex = 60 })
+    local sizer = Instance.new("UIScale")
+    sizer.Scale = scale * 0.92
+    sizer.Parent = holder
+    local glass = UI.glass(holder, { level = "popover", radius = "rCard", shadow = 34, shadowY = 14,
+        rimHi = 0.62, name = "Panel",
+        props = { Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y } })
+    local group = UI.group(glass, { Size = UDim2.fromScale(1, 0), AutomaticSize = Enum.AutomaticSize.Y })
+    UI.pad(group, opts.pad or 6)
+    UI.list(group, "y", opts.gap or 2)
+    pop.frame = holder
+    local closed = false
+
+    local function place()
+        local view = G.viewport()
+        local a, s = anchor.AbsolutePosition, anchor.AbsoluteSize
+        local size = holder.AbsoluteSize
+        local w, h = width * scale, math.max(size.Y, 1)
+        local x
+        if opts.align == "left" then x = a.X
+        elseif opts.align == "center" then x = a.X + s.X / 2 - w / 2
+        else x = a.X + s.X - w end
+        local y = a.Y + s.Y + 6 * scale
+        local above = opts.side == "above" or (y + h > view.Y - 8 and a.Y - h - 6 * scale > 8)
+        if above then y = a.Y - h - 6 * scale end
+        local origin = UI.overlay.AbsolutePosition
+        x = math.clamp(x - origin.X, 8, math.max(8, view.X - w - 8))
+        y = math.clamp(y - origin.Y, 8, math.max(8, view.Y - h - 8))
+        holder.Position = UDim2.fromOffset(x, y)
+        return above
+    end
+
+    function pop.close(instant)
+        if closed then return end
+        closed = true
+        if openAnchors[anchor] == pop then openAnchors[anchor] = nil end
+        local at = table.find(popovers, pop)
+        if at then table.remove(popovers, at) end
+        if pop._follow then pop._follow.dead = true; pop._follow = nil end
+        if opts.onClose then G.try("popover.close", opts.onClose) end
+        if instant then holder:Destroy(); return end
+        Motion.to(sizer, "Scale", scale * 0.94, "quick")
+        UI.fade(group, 0, "quick")
+        Motion.to(glass, "BackgroundTransparency", 1, "quick", function() holder:Destroy() end)
+    end
+
+    G.try("popover.build", build, group, pop.close)
+    place()
+    pop._follow = Motion.every(function()
+        if closed or not holder.Parent then return end
+        place()
+    end, nil, "popover.follow")
+    UI.setFade(group, 0)
+    UI.fade(group, 1, "quick")
+    Motion.to(sizer, "Scale", scale, "snappy")
+    popovers[#popovers + 1] = pop
+    openAnchors[anchor] = pop
+    UI.sfx("open", 0.5)
+    return pop
+end
+
+function UI.menu(anchor, items, opts)
+    opts = opts or {}
+    return UI.popover(anchor, { width = opts.width or 208, align = opts.align, side = opts.side }, function(content, close)
+        local rows = opts.rows or 11
+        if #items > rows then
+            local holder = UI.frame(content, { Name = "Long", Size = UDim2.new(1, 0, 0, rows * 34 - 2) })
+            local scroller, scroll = UI.scroll(holder, { Size = UDim2.fromScale(1, 1), Name = "Scroll" })
+            content = UI.frame(scroller, { Name = "Rows", Size = UDim2.new(1, -9, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
+            UI.list(content, "y", 2)
+            for index, item in ipairs(items) do
+                if type(item) == "table" and item.checked then
+                    task.defer(function() if holder.Parent then scroll.to((index - 4) * 34, true) end end)
+                    break
+                end
+            end
+        end
+        for index, item in ipairs(items) do
+            if item == "divider" then
+                local line = UI.frame(content, { Size = UDim2.new(1, -12, 0, 1), LayoutOrder = index,
+                    Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "strokeA" } })
+                line.Position = UDim2.fromOffset(6, 0)
+            else
+                local row = UI.frame(content, { Size = UDim2.new(1, 0, 0, 32), LayoutOrder = index, Theme = { BackgroundColor3 = "ink" } })
+                UI.corner(row, "rSmall")
+                local x = 10
+                if item.icon then
+                    UI.icon(row, item.icon, 16, item.danger and "bad" or "sub", { Position = UDim2.new(0, 10, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5) })
+                    x = 34
+                end
+                UI.text(row, item.label, "label", item.danger and "bad" or "ink", {
+                    Position = UDim2.new(0, x, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5), TextSize = 13 })
+                if item.checked then
+                    UI.icon(row, "check", 15, "accent", { Position = UDim2.new(1, -10, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5) })
+                elseif item.hint then
+                    UI.text(row, item.hint, "mono", "faint", { Position = UDim2.new(1, -10, 0.5, 0), AnchorPoint = Vector2.new(1, 0.5), TextSize = 11 })
+                end
+                UI.button(row, {
+                    hover = function(on) Motion.to(row, "BackgroundTransparency", on and T.fill2A or 1, "quick") end,
+                    click = function()
+                        UI.sfx("click", 0.6)
+                        if not item.keepOpen then close() end
+                        if item.run then item.run() end
+                    end,
+                })
+            end
+        end
+    end)
+end
+
+local tip
+function UI.tooltip(target, text)
+    if not text or text == "" then return end
+    local token = 0
+    target.MouseEnter:Connect(function()
+        token += 1
+        local mine = token
+        task.delay(0.55, function()
+            if mine ~= token or not G.alive or not UI.overlay or not target:IsDescendantOf(game) then return end
+            if tip then tip:Destroy() end
+            local scale = UI.overlayScale and UI.overlayScale() or 1
+            local holder = UI.frame(UI.overlay, { Name = "Tip", AutomaticSize = Enum.AutomaticSize.XY, ZIndex = 80 })
+            local sizer = Instance.new("UIScale"); sizer.Scale = scale; sizer.Parent = holder
+            local body = UI.glass(holder, { level = "popover", radius = "rSmall", sheen = false, grain = false,
+                props = { AutomaticSize = Enum.AutomaticSize.XY } })
+            UI.pad(body, 6, 9)
+            local label = UI.text(body, text, "caption", "sub", { TextWrapped = true, AutomaticSize = Enum.AutomaticSize.XY })
+            local limit = Instance.new("UISizeConstraint"); limit.MaxSize = Vector2.new(260, math.huge); limit.Parent = label
+            local mouse = UIS:GetMouseLocation()
+            local view = G.viewport()
+            holder.Position = UDim2.fromOffset(math.clamp(mouse.X + 14, 8, view.X - 280 * scale), math.clamp(mouse.Y + 18, 8, view.Y - 60))
+            tip = holder
+        end)
+    end)
+    target.MouseLeave:Connect(function()
+        token += 1
+        if tip then tip:Destroy(); tip = nil end
+    end)
+end
+function UI.hideTip()
+    if tip then tip:Destroy(); tip = nil end
+end
+
+UI.scrollbar = "always"
+local scrollers = setmetatable({}, { __mode = "k" })
+function UI.setScrollbar(mode)
+    UI.scrollbar = mode
+    for _, paint in pairs(scrollers) do G.try("ui.scrollbar", paint) end
+end
+local BAR_REST, BAR_WIDE, BAR_GRIP = 4, 8, 16
+function UI.scroll(parent, props)
+    local scroller = Instance.new("ScrollingFrame")
+    scroller.BackgroundTransparency = 1
+    scroller.BorderSizePixel = 0
+    scroller.ScrollBarThickness = 0
+    scroller.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroller.CanvasSize = UDim2.new()
+    scroller.ElasticBehavior = Enum.ElasticBehavior.Never
+    scroller.ScrollingEnabled = G.touch
+    if props then
+        for key, value in pairs(props) do scroller[key] = value end
+    end
+    scroller.Parent = parent
+    local thumb = UI.frame(parent, { Name = "Thumb", Size = UDim2.fromOffset(BAR_REST, 40), AnchorPoint = Vector2.new(1, 0), ZIndex = 8,
+        Theme = { BackgroundColor3 = "ink" }, BackgroundTransparency = 1 })
+    UI.corner(thumb, true)
+    local grip = UI.new("TextButton", { Name = "Scrollbar", Text = "", AutoButtonColor = false, BackgroundTransparency = 1,
+        AnchorPoint = Vector2.new(1, 0), Size = UDim2.fromOffset(BAR_GRIP, 40), ZIndex = 9, Visible = false, Parent = parent })
+    local target = 0
+    local spring = Motion.spring(1, "smooth", function(x)
+        scroller.CanvasPosition = Vector2.new(0, x[1])
+    end, 0.2)
+    local function limit()
+        return math.max(0, scroller.AbsoluteCanvasSize.Y - scroller.AbsoluteWindowSize.Y)
+    end
+    local hovered, dragging, flashing, width = false, false, false, BAR_REST
+    local bar = { top = 0, size = 0, span = 0 }
+    local function refresh()
+        local window, canvas = scroller.AbsoluteWindowSize.Y, scroller.AbsoluteCanvasSize.Y
+        local needed = canvas > window + 1 and window > 0 and UI.scrollbar ~= "off"
+        if grip.Visible ~= needed then grip.Visible = needed end
+        if not needed then thumb.BackgroundTransparency = 1; return false end
+        local track = scroller.AbsoluteSize.Y - 12
+        local size = math.max(28, track * window / canvas)
+        local ratio = scroller.CanvasPosition.Y / math.max(1, canvas - window)
+        local unit = UI.unit()
+        local right = (scroller.AbsolutePosition.X - parent.AbsolutePosition.X + scroller.AbsoluteSize.X) / unit
+        local top = scroller.AbsolutePosition.Y - parent.AbsolutePosition.Y
+        thumb.Size = UDim2.fromOffset(width, size / unit)
+        thumb.Position = UDim2.new(0, right - 3, 0, (top + 6 + (track - size) * ratio) / unit)
+        grip.Size = UDim2.fromOffset(BAR_GRIP, scroller.AbsoluteSize.Y / unit)
+        grip.Position = UDim2.new(0, right, 0, top / unit)
+        bar.top, bar.size, bar.span = scroller.AbsolutePosition.Y + 6, size, track - size
+        return true
+    end
+    local widen = Motion.spring(1, "snappy", function(x)
+        width = x[1]
+        refresh()
+    end, 0.05)
+    widen:snap({ BAR_REST })
+    local function paint()
+        if not refresh() then return end
+        local alpha = dragging and 0.15 or hovered and 0.28 or flashing and 0.42 or (UI.scrollbar == "always" and 0.40 or 1)
+        Motion.to(thumb, "BackgroundTransparency", alpha, alpha >= 0.8 and "gentle" or "quick")
+        widen:to({ (dragging or hovered) and BAR_WIDE or BAR_REST })
+    end
+    scrollers[scroller] = paint
+    local function flash()
+        flashing = true
+        paint()
+        task.delay(0.9, function()
+            if thumb.Parent then flashing = false; paint() end
+        end)
+    end
+    scroller:GetPropertyChangedSignal("CanvasPosition"):Connect(flash)
+    scroller:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(function()
+        if target > limit() then target = limit(); spring:to({ target }) end
+        paint()
+    end)
+    scroller:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(paint)
+    local grab = 0
+    local function follow(y)
+        local ratio = bar.span > 0 and math.clamp((y - grab - bar.top) / bar.span, 0, 1) or 0
+        target = ratio * limit()
+        spring:snap({ target })
+    end
+    UI.drag(grip, function(point)
+        if not refresh() then return false end
+        local at = bar.top + bar.span * (scroller.CanvasPosition.Y / math.max(1, limit()))
+        grab = (point.Y >= at and point.Y <= at + bar.size) and (point.Y - at) or bar.size * 0.5
+        dragging = true
+        follow(point.Y)
+        paint()
+        return true
+    end, function(point) follow(point.Y) end, function()
+        dragging = false
+        paint()
+    end)
+    grip.MouseEnter:Connect(function() hovered = true; paint() end)
+    grip.MouseLeave:Connect(function() hovered = false; paint() end)
+    local wheel = G.safe("ui.wheel", function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseWheel or G.touch then return end
+        if not spring:moving() then
+            spring.x[1], spring.g[1] = scroller.CanvasPosition.Y, scroller.CanvasPosition.Y
+            target = scroller.CanvasPosition.Y
+        end
+        target = math.clamp(target - input.Position.Z * 92, 0, limit())
+        spring:to({ target })
+    end)
+    scroller.InputChanged:Connect(wheel)
+    grip.InputChanged:Connect(wheel)
+    task.defer(function() if scroller.Parent then G.try("ui.scrollbar", paint) end end)
+    local api = { frame = scroller, thumb = thumb, grip = grip }
+    function api.to(y, instant)
+        target = math.clamp(y, 0, limit())
+        if instant then spring:snap({ target }) else
+            spring.x[1] = scroller.CanvasPosition.Y
+            spring:to({ target })
+        end
+    end
+    function api.top(instant) api.to(0, instant) end
+    return scroller, api
+end
+
+function UI.divider(parent, order)
+    return UI.frame(parent, { Name = "Divider", Size = UDim2.new(1, 0, 0, 1), LayoutOrder = order or 0,
+        Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "strokeA" } })
+end
+function UI.badge(parent, text, color, props)
+    local badge = UI.frame(parent, { AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 18),
+        Theme = { BackgroundColor3 = color or "accent" }, BackgroundTransparency = 0.82 })
+    UI.corner(badge, 6)
+    UI.pad(badge, 0, 6)
+    UI.text(badge, text, "eyebrow", color or "accent", { TextSize = 9, Size = UDim2.fromScale(0, 1), AutomaticSize = Enum.AutomaticSize.X })
+    if props then
+        for key, value in pairs(props) do badge[key] = value end
+    end
+    return badge
+end
+end
+
+do -- 05_config.lua
+-- ============================================================================
+--  05 config   flags, profiles, autoload, per-script danger flags
+-- ============================================================================
+local S, fs, util = G.S, G.fs, G.util
+local UIS = S.UserInputService
+local Config = { profile = "default", changed = G.Signal.new(), loaded = G.Signal.new(),
+    danger = {}, dangerReady = false, skippedDangerous = {} }
+G.Config = Config
+
+local values, defaults, listeners = {}, {}, {}
+local binds = {}
+local actions = {}
+
+local SCRIPT_SLUG = (string.gsub(tostring(OBLITSO_CONFIG.ScriptName or "OBLITSO"), "%W", "_"))
+local SCRIPT_ROOT = (OBLITSO_CONFIG.SaveFolder or "OBLGUI") .. "/" .. SCRIPT_SLUG
+local CONFIG_DIR  = SCRIPT_ROOT .. "/configs"
+local APP_FILE    = SCRIPT_ROOT .. "/app.json"
+local AUTOLOAD    = CONFIG_DIR .. "/_autoload.txt"
+local DANGER_FILE = CONFIG_DIR .. "/_dangerous.json"
+
+pcall(fs.mkdir, SCRIPT_ROOT)
+pcall(fs.mkdir, CONFIG_DIR)
+
+Config.dir = CONFIG_DIR
+Config.scriptRoot = SCRIPT_ROOT
+Config.values, Config.defaults, Config.binds = values, defaults, binds
+
+local function isApp(id) return string.sub(id, 1, 4) == "app." end
+local function encode(value)
+    local kind = typeof(value)
+    if kind == "Color3" then return { __c = util.toHex(value) } end
+    if kind == "EnumItem" then return { __e = tostring(value.EnumType), v = value.Name } end
+    if kind == "table" then
+        local out = {}
+        for k, v in pairs(value) do out[k] = encode(v) end
+        return out
+    end
+    return value
+end
+local function decode(value)
+    if type(value) ~= "table" then return value end
+    if type(value.__c) == "string" then
+        local ok, color = pcall(util.hex, value.__c)
+        return ok and color or nil
+    end
+    if value.__e then
+        local ok, item = pcall(function() return Enum[value.__e][value.v] end)
+        return ok and item or nil
+    end
+    local out = {}
+    for k, v in pairs(value) do out[k] = decode(v) end
+    return out
+end
+local function sameType(a, b) return typeof(a) == typeof(b) end
+
+local function profilePath(name)
+    return CONFIG_DIR .. "/" .. name .. ".json"
+end
+
+local appStored = {}
+
+local saveApp = util.debounce(0.4, function()
+    local out = {}
+    for id, value in pairs(values) do
+        if isApp(id) and value ~= defaults[id] then out[id] = encode(value) end
+    end
+    fs.writeJson(APP_FILE, { values = out })
+end)
+
+function Config.saveProfile(name)
+    name = name or Config.profile
+    if not name or name == "" then return false end
+    local out = {}
+    for id, value in pairs(values) do
+        if not isApp(id) and value ~= defaults[id] then out[id] = encode(value) end
+    end
+    local bindOut = {}
+    for id, bind in pairs(binds) do
+        if not isApp(id) then bindOut[id] = { key = bind.key, mode = bind.mode } end
+    end
+    return fs.writeJson(profilePath(name), {
+        version = 1,
+        game = game.GameId,
+        placeId = game.PlaceId,
+        saved = os.time(),
+        values = out,
+        binds = bindOut,
+    })
+end
+function Config.save()
+    saveApp()
+    Config.saveProfile(Config.profile)
+end
+
+function Config.listProfiles()
+    local out = {}
+    local files = fs.list(CONFIG_DIR)
+    for _, file in ipairs(files) do
+        local name = string.match(file, "([^/]+)%.json$")
+        if name and string.sub(name, 1, 1) ~= "_" then
+            out[#out + 1] = name
+        end
+    end
+    table.sort(out)
+    return out
+end
+function Config.deleteProfile(name)
+    if not name or name == "" then return false end
+    local path = profilePath(name)
+    if not fs.exists(path) then return false end
+    local ok = fs.remove(path)
+    if ok and Config.getAutoload() == name then
+        Config.setAutoload("")
+    end
+    return ok
+end
+function Config.getAutoload()
+    local data = fs.read(AUTOLOAD)
+    if not data then return "" end
+    return (string.gsub(data, "%s+", ""))
+end
+function Config.setAutoload(name)
+    if not name or name == "" then
+        fs.write(AUTOLOAD, "")
+    else
+        fs.write(AUTOLOAD, name)
+    end
+end
+
+function Config.define(id, default)
+    if defaults[id] ~= nil then return values[id] end
+    defaults[id] = default
+    if isApp(id) then
+        local saved = decode(appStored[id])
+        if saved ~= nil and sameType(saved, default) then values[id] = saved else values[id] = default end
+    else
+        values[id] = default
+    end
+    return values[id]
+end
+function Config.get(id) return values[id] end
+function Config.set(id, value, quiet)
+    if defaults[id] == nil then defaults[id] = value end
+    local old = values[id]
+    if old == value and type(value) ~= "table" then return end
+    values[id] = value
+    local list = listeners[id]
+    if list then
+        for _, fn in ipairs(table.clone(list)) do G.try("config." .. id, fn, value, old) end
+    end
+    if not quiet then
+        Config.changed:fire(id, value)
+        if isApp(id) then saveApp() else Config.saveProfile() end
+    end
+end
+function Config.reset(id) if defaults[id] ~= nil then Config.set(id, util.copy(defaults[id])) end end
+function Config.on(id, fn, now)
+    local list = listeners[id]
+    if not list then list = {}; listeners[id] = list end
+    list[#list + 1] = fn
+    if now and values[id] ~= nil then G.try("config." .. id, fn, values[id], nil) end
+    return function()
+        local at = table.find(list, fn)
+        if at then table.remove(list, at) end
+    end
+end
+
+-- ---------- danger flags ----------
+local function readDangerFile()
+    local data = fs.readJson(DANGER_FILE)
+    if type(data) ~= "table" then return {} end
+    local out = {}
+    local list = data.user
+    if type(list) == "table" then
+        for _, id in ipairs(list) do out[id] = "user" end
+    end
+    return out
+end
+local function writeDangerFile()
+    local list = {}
+    for id, source in pairs(Config.danger) do
+        if source == "user" then list[#list + 1] = id end
+    end
+    table.sort(list)
+    fs.writeJson(DANGER_FILE, { version = 1, user = list })
+end
+function Config.initDanger()
+    local stored = readDangerFile()
+    for id, src in pairs(stored) do Config.danger[id] = src end
+    Config.dangerReady = true
+end
+function Config.setDanger(id, source)
+    if not id then return end
+    if source == nil then
+        Config.danger[id] = nil
+    else
+        Config.danger[id] = source
+    end
+    writeDangerFile()
+end
+function Config.isDangerous(id)
+    return Config.danger[id] ~= nil
+end
+function Config.dangerSource(id)
+    return Config.danger[id]
+end
+
+-- ---------- profile load/save ----------
+function Config.loadProfile(name)
+    if not name or name == "" then return false end
+    local data = fs.readJson(profilePath(name))
+    if type(data) ~= "table" then return false end
+    local storedValues = type(data.values) == "table" and data.values or {}
+    local storedBinds  = type(data.binds) == "table" and data.binds or {}
+    local skipped = {}
+    for id, default in pairs(defaults) do
+        if not isApp(id) then
+            local saved = decode(storedValues[id])
+            if saved == nil or not sameType(saved, default) then
+                Config.set(id, util.copy(default), true)
+            else
+                if saved == true and Config.isDangerous(id) then
+                    Config.set(id, false, true)
+                    skipped[#skipped + 1] = id
+                else
+                    Config.set(id, saved, true)
+                end
+            end
+        end
+    end
+    table.clear(binds)
+    for id, entry in pairs(storedBinds) do
+        if type(entry) == "table" and entry.key then
+            binds[id] = { key = entry.key, mode = entry.mode or "toggle" }
+        end
+    end
+    Config.profile = name
+    Config.skippedDangerous = skipped
+    return true
+end
+function Config.load(name)
+    if not Config.loadProfile(name) then return false end
+    if Config.bindsChanged then Config.bindsChanged:fire(nil) end
+    Config.loaded:fire(name)
+    return true
+end
+function Config.resetAll(includeApp)
+    for id, default in pairs(defaults) do
+        if includeApp or not isApp(id) then Config.set(id, util.copy(default)) end
+    end
+end
+
+function Config.init()
+    local appData = fs.readJson(APP_FILE)
+    if type(appData) == "table" and type(appData.values) == "table" then
+        appStored = appData.values
+    end
+    local savedDanger = readDangerFile()
+    for id, src in pairs(savedDanger) do Config.danger[id] = src end
+    Config.dangerReady = true
+    -- autoload: only if pointer exists and points at a real config
+    local target = Config.getAutoload()
+    if target ~= "" and fs.exists(profilePath(target)) then
+        Config.loadProfile(target)
+    end
+end
+
+-- ---------- keybinds ----------
+local byKey = {}
+local function keyName(input)
+    if input.UserInputType == Enum.UserInputType.Keyboard then return input.KeyCode.Name end
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then return "MouseButton2" end
+    if input.UserInputType == Enum.UserInputType.MouseButton3 then return "MouseButton3" end
+    return nil
+end
+Config.keyName = keyName
+local function reindex()
+    table.clear(byKey)
+    for id, bind in pairs(binds) do
+        if bind.key then
+            local list = byKey[bind.key]
+            if not list then list = {}; byKey[bind.key] = list end
+            list[#list + 1] = id
+        end
+    end
+end
+Config.bindsChanged = G.Signal.new()
+function Config.bind(id, key, mode)
+    if not key or key == "None" then
+        binds[id] = nil
+    else
+        binds[id] = { key = key, mode = mode or (binds[id] and binds[id].mode) or "toggle" }
+    end
+    reindex()
+    Config.bindsChanged:fire(id)
+    Config.saveProfile()
+end
+function Config.bindOf(id) return binds[id] end
+function Config.action(id, fn) actions[id] = fn end
+function Config.clearKey(id)
+    if not id then return end
+    Config.bind(id, nil)
+    if defaults[id] ~= nil then Config.set(id, "None") end
+end
+
+local SHORT = {
+    LeftControl = "LCtrl", RightControl = "RCtrl", LeftShift = "LShift", RightShift = "RShift",
+    LeftAlt = "LAlt", RightAlt = "RAlt", MouseButton2 = "RMB", MouseButton3 = "MMB",
+    Return = "Enter", Backspace = "Bksp", CapsLock = "Caps", Escape = "Esc", Delete = "Del",
+    Insert = "Ins", PageUp = "PgUp", PageDown = "PgDn", Semicolon = ";", Quote = "'",
+    Comma = ",", Period = ".", Slash = "/", BackSlash = "\\", LeftBracket = "[", RightBracket = "]",
+    Minus = "-", Equals = "=", Backquote = "`", Space = "Space", Unknown = "None",
+    One = "1", Two = "2", Three = "3", Four = "4", Five = "5", Six = "6", Seven = "7",
+    Eight = "8", Nine = "9", Zero = "0",
+}
+function Config.keyLabel(key)
+    if not key or key == "None" then return "None" end
+    return SHORT[key] or (string.gsub(key, "^Keypad", "Num"))
+end
+
+Config.capturing = false
+Config.captureToken = 0
+Config.captureDoneAt = 0
+
+function Config.captureKey(done, timeout)
+    if Config.capturing then return end
+    Config.capturing = true
+    Config.captureToken += 1
+    local token = Config.captureToken
+    local connection
+    local finished = false
+    local function finish(key, cancelled, cleared)
+        if finished then return end
+        finished = true
+        if connection then connection:Disconnect() end
+        Config.capturing = false
+        Config.captureDoneAt = os.clock()
+        if done then G.try("capture", done, key, cancelled, cleared) end
+    end
+    connection = UIS.InputBegan:Connect(function(input)
+        if token ~= Config.captureToken then return end
+        local key = keyName(input)
+        if not key then return end
+        if key == "Escape" then finish(nil, true, false)
+        elseif key == "Backspace" or key == "Delete" then finish(nil, true, true)
+        else finish(key, false, false) end
+    end)
+    G.own(connection)
+    task.delay(timeout or 5, function()
+        if token == Config.captureToken and not finished then finish(nil, true, false) end
+    end)
+end
+
+function Config.listen()
+    reindex()
+    G.connect(UIS.InputBegan, function(input, processed)
+        if Config.capturing then return end
+        if Config.captureDoneAt > 0 and os.clock() - Config.captureDoneAt < 0.08 then return end
+        local key = keyName(input)
+        if not key then return end
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            if UIS:GetFocusedTextBox() then return end
+        elseif processed then
+            return
+        end
+        local list = byKey[key]
+        if not list then return end
+        for _, id in ipairs(list) do
+            local bind = binds[id]
+            if bind then
+                if actions[id] then
+                    G.try("bind." .. id, actions[id])
+                elseif type(values[id]) == "boolean" then
+                    if bind.mode == "hold" then Config.set(id, true)
+                    else Config.set(id, not values[id]) end
+                end
+            end
+        end
+    end, "keybinds")
+    G.connect(UIS.InputEnded, function(input)
+        if Config.capturing then return end
+        if Config.captureDoneAt > 0 and os.clock() - Config.captureDoneAt < 0.08 then return end
+        local key = keyName(input)
+        local list = key and byKey[key]
+        if not list then return end
+        for _, id in ipairs(list) do
+            local bind = binds[id]
+            if bind and bind.mode == "hold" and type(values[id]) == "boolean" and not actions[id] then
+                Config.set(id, false)
+            end
+        end
+    end, "keybinds")
+end
+function Config.keyDown(key)
+    if not key or key == "None" then return false end
+    if key == "MouseButton2" then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) end
+    if key == "MouseButton3" then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton3) end
+    local ok, code = pcall(function() return Enum.KeyCode[key] end)
+    return ok and code ~= nil and UIS:IsKeyDown(code)
+end
+end
+do -- 06_controls.lua
+-- ============================================================================
+--  06 controls  rows, right-click menu, danger flags
+-- ============================================================================
+local S, util, Motion, Theme, T, UI, Config = G.S, G.util, G.Motion, G.Theme, G.T, G.UI, G.Config
+local UIS = S.UserInputService
+local Controls = { bindables = {}, specs = {} }
+G.Controls = Controls
+
+local function makeRow(section, spec, controlWidth)
+    section.count = (section.count or 0) + 1
+    local row = UI.frame(section.body, { Name = spec.label or "Row", Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = section.count })
+    if section.count > 1 then
+        UI.frame(row, { Name = "Rule", Size = UDim2.new(1, -28, 0, 1), Position = UDim2.fromOffset(14, 0),
+            Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "strokeA" } })
+    end
+    local wash = UI.frame(row, { Name = "Wash", Size = UDim2.new(1, -8, 1, -6), Position = UDim2.fromOffset(4, 3),
+        Theme = { BackgroundColor3 = "ink" }, BackgroundTransparency = 1, ZIndex = 0 })
+    UI.corner(wash, "rSmall")
+    local left = UI.frame(row, { Name = "Left", Size = UDim2.new(1, -((controlWidth or 150) + 30), 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y, Position = UDim2.fromOffset(0, 0) })
+    UI.pad(left, 12, 0, 12, spec.icon and 42 or 14)
+    UI.list(left, "y", 2)
+    if spec.icon then
+        UI.icon(row, spec.icon, 17, "sub", { Position = UDim2.fromOffset(14, 13), Name = "Icon" })
+    end
+    local titleLine = UI.frame(left, { Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 1 })
+    UI.list(titleLine, "x", 7, { v = "Center" })
+    local label = UI.text(titleLine, spec.label or "", "label", "ink", { TextTruncate = Enum.TextTruncate.AtEnd,
+        LayoutOrder = 1, AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 20) })
+    if spec.badge then UI.badge(titleLine, spec.badge, spec.badgeColor, { LayoutOrder = 2 }) end
+    -- danger pill: shown when the toggle is flagged dangerous by owner or user
+    if spec.id and spec.kind == "toggle" then
+        local pill = UI.frame(titleLine, { Name = "Danger", AutomaticSize = Enum.AutomaticSize.X,
+            Size = UDim2.fromOffset(0, 18), LayoutOrder = 3,
+            Theme = { BackgroundColor3 = "bad" }, BackgroundTransparency = 0.82, Visible = false })
+        UI.corner(pill, 6)
+        UI.pad(pill, 0, 6)
+        UI.text(pill, "BAN RISK", "eyebrow", "bad", { TextSize = 9, Size = UDim2.fromScale(0, 1), AutomaticSize = Enum.AutomaticSize.X })
+        local function refresh()
+            pill.Visible = Config.isDangerous(spec.id)
+        end
+        Config.dangerChanged = Config.dangerChanged or G.Signal.new()
+        Config.dangerChanged:connect(function(changed)
+            if changed == nil or changed == spec.id then refresh() end
+        end)
+        refresh()
+    end
+    if spec.desc and spec.desc ~= "" then
+        UI.text(left, spec.desc, "caption", "sub", { TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+            Size = UDim2.new(1, 0, 0, 0), LayoutOrder = 2, LineHeight = 1.15 })
+    end
+    local slot = UI.frame(row, { Name = "Slot", AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -14, 0, 0),
+        Size = UDim2.fromOffset(0, 44), AutomaticSize = Enum.AutomaticSize.X, ZIndex = 6 })
+    UI.list(slot, "x", 8, { h = "Right", v = "Center" })
+    local api = { frame = row, left = left, slot = slot, label = label, wash = wash }
+    function api.hover(on) Motion.to(wash, "BackgroundTransparency", on and 0.965 or 1, "quick") end
+    function api.flash()
+        wash.BackgroundTransparency = 0.86
+        Theme.unbind(wash, "BackgroundColor3")
+        wash.BackgroundColor3 = T.accent
+        Motion.to(wash, "BackgroundTransparency", 1, "lazy", function() Theme.bind(wash, "BackgroundColor3", "ink") end)
+    end
+    if section.index then
+        section.index({ label = spec.label or "", desc = spec.desc or "", row = api, id = spec.id })
+    end
+    return api
+end
+Controls.row = makeRow
+
+local function bindChip(slot, id, order)
+    local chip = UI.frame(slot, { Name = "Bind", Size = UDim2.fromOffset(0, 20), AutomaticSize = Enum.AutomaticSize.X,
+        LayoutOrder = order or 1, Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" }, Visible = false })
+    UI.corner(chip, 6)
+    UI.pad(chip, 0, 6)
+    local text = UI.text(chip, "", "mono", "sub", { TextSize = 11, Size = UDim2.fromScale(0, 1), AutomaticSize = Enum.AutomaticSize.X })
+    local function refresh()
+        local bind = Config.bindOf(id)
+        chip.Visible = bind ~= nil and bind.key ~= nil
+        if bind and bind.key then
+            text.Text = Config.keyLabel(bind.key) .. (bind.mode == "hold" and " .hold" or "")
+        end
+    end
+    Config.bindsChanged:connect(function(changed) if changed == id and chip.Parent then refresh() end end)
+    refresh()
+    return chip
+end
+
+local function contextMenu(anchor, spec, extra)
+    local items = {}
+    local id = spec.id
+    if id then
+        items[#items + 1] = { label = "Reset to default", icon = "rotate-ccw", run = function() Config.reset(id) end }
+    end
+    if spec.bindable and id then
+        local bind = Config.bindOf(id)
+        items[#items + 1] = { label = bind and "Change key..." or "Bind to a key...", icon = "keyboard", run = function()
+            G.Window.toast({ title = "Press a key", text = "Esc cancels  /  Backspace clears  /  times out in 5 s",
+                icon = "keyboard", time = 2.6 })
+            Config.captureKey(function(key, cancelled, cleared)
+                if cancelled then return end
+                if cleared then
+                    Config.clearKey(id)
+                    G.Window.toast({ title = "Key cleared", text = spec.label, icon = "keyboard" })
+                else
+                    Config.bind(id, key)
+                    G.Window.toast({ title = key and ("Bound to " .. Config.keyLabel(key)) or "Key cleared",
+                        text = spec.label, icon = "keyboard" })
+                end
+            end, 5)
+        end }
+        if bind then
+            if spec.kind == "toggle" then
+                items[#items + 1] = { label = "Hold to activate", icon = "hand", checked = bind.mode == "hold", run = function()
+                    Config.bind(id, bind.key, bind.mode == "hold" and "toggle" or "hold")
+                end }
+            end
+            items[#items + 1] = { label = "Clear key", icon = "x", run = function() Config.clearKey(id) end }
+        end
+    end
+    -- danger flag option: only for toggles. Owner-flagged entries show as locked.
+    if id and spec.kind == "toggle" then
+        local source = Config.dangerSource(id)
+        if source == "owner" then
+            items[#items + 1] = { label = "Owner-flagged as ban risk", icon = "shield", run = function() end }
+        elseif source == "user" then
+            items[#items + 1] = { label = "Unmark as dangerous", icon = "shield", danger = true, run = function()
+                Config.setDanger(id, nil)
+                if Config.dangerChanged then Config.dangerChanged:fire(id) end
+                G.Window.toast({ title = "Unflagged", text = spec.label .. " is no longer marked dangerous.", icon = "shield", tone = "ok" })
+            end }
+        else
+            items[#items + 1] = { label = "Mark as dangerous", icon = "shield", danger = true, run = function()
+                Config.setDanger(id, "user")
+                if Config.dangerChanged then Config.dangerChanged:fire(id) end
+                G.Window.toast({ title = "Flagged", text = spec.label .. " will not auto-enable on load.", icon = "shield", tone = "warn" })
+            end }
+        end
+    end
+    if extra then
+        for _, item in ipairs(extra) do items[#items + 1] = item end
+    end
+    if #items > 0 then UI.menu(anchor, items, { align = "right" }) end
+end
+
+function Controls.toggle(section, spec)
+    spec.kind = "toggle"
+    spec.bindable = spec.bindable ~= false
+    local id = spec.id
+    local value = id and Config.define(id, spec.default == true) or (spec.default == true)
+    local row = makeRow(section, spec, spec.children and 92 or 62)
+    if id then
+        Controls.specs[id] = { label = spec.label or id, id = id, owner = spec.dangerous == true,
+            page = section.page, kind = "toggle" }
+        if spec.dangerous == true then Config.danger[id] = "owner" end
+    end
+    if id and spec.bindable then
+        bindChip(row.slot, id, 1)
+        Controls.bindables[id] = { label = spec.label or id, kind = "toggle", page = section.page }
+    end
+    local track = UI.frame(row.slot, { Name = "Switch", Size = UDim2.fromOffset(42, 24), LayoutOrder = 3 })
+    UI.corner(track, true)
+    local knob = UI.frame(track, { Name = "Knob", Size = UDim2.fromOffset(18, 18), Position = UDim2.new(0, 3, 0.5, 0),
+        AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = Color3.new(1, 1, 1) })
+    UI.corner(knob, true)
+    if UI.fx.shadow then
+        local shadow = Instance.new("UIShadow")
+        shadow.BlurRadius = UDim.new(0, 5); shadow.Offset = UDim2.fromOffset(0, 1); shadow.Transparency = 0.7
+        shadow.Parent = knob
+    end
+    local pressed = false
+    local function paint(instant)
+        local on = value
+        local color = on and T.accent or T.ink
+        local alpha = on and 0 or T.fill3A - 0.05
+        local width = pressed and 23 or 18
+        local x = on and (42 - 3 - width) or 3
+        if instant then
+            track.BackgroundColor3, track.BackgroundTransparency = color, alpha
+            Motion.snap(knob, "Position", UDim2.new(0, x, 0.5, 0)); Motion.snap(knob, "Size", UDim2.fromOffset(width, 18))
+        else
+            Motion.to(track, "BackgroundColor3", color, "quick")
+            Motion.to(track, "BackgroundTransparency", alpha, "quick")
+            Motion.to(knob, "Position", UDim2.new(0, x, 0.5, 0), pressed and "quick" or "bouncy")
+            Motion.to(knob, "Size", UDim2.fromOffset(width, 18), "snappy")
+        end
+    end
+    paint(true)
+    Theme.changed:connect(function() if track.Parent then paint(true) end end)
+    local api = { row = row, id = id }
+    function api.get() return value end
+    function api.set(next, quiet)
+        next = next == true
+        if next == value then return end
+        if id then Config.set(id, next, quiet) else
+            value = next
+            paint()
+            if spec.changed then G.try("toggle", spec.changed, value) end
+        end
+    end
+    if id then
+        Config.on(id, function(next)
+            value = next == true
+            if track.Parent then paint() end
+            if spec.changed then spec.changed(value) end
+        end)
+        -- Restoring after load: skip ON for dangerous toggles unless session override
+        if spec.changed then task.defer(G.safe("toggle.init", function()
+            if value and Config.isDangerous(id) and not Config.sessionDangerOverride then
+                Config.set(id, false, true)
+                return
+            end
+            spec.changed(value)
+        end)) end
+    end
+    local sub
+    if spec.children then
+        local chevron = UI.frame(row.slot, { Name = "More", Size = UDim2.fromOffset(22, 22), LayoutOrder = 2 })
+        local icon = UI.icon(chevron, "chevron-down", 15, "faint", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+        local holder = UI.frame(section.body, { Name = "Sub", Size = UDim2.new(1, 0, 0, 0), ClipsDescendants = true, LayoutOrder = section.count })
+        section.count += 1
+        holder.LayoutOrder = section.count
+        local inner = UI.frame(holder, { Name = "Inner", Size = UDim2.new(1, -18, 0, 0), Position = UDim2.fromOffset(18, 0),
+            AutomaticSize = Enum.AutomaticSize.Y })
+        UI.list(inner, "y", 0)
+        UI.frame(holder, { Name = "Guide", Size = UDim2.new(0, 1, 1, -12), Position = UDim2.fromOffset(22, 2),
+            Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "strokeA" } })
+        sub = { body = inner, count = 0, index = section.index, page = section.page, nested = true }
+        local open = false
+        local built = false
+        local function size(instant)
+            local h = open and (inner.AbsoluteSize.Y / UI.unit()) or 0
+            if instant then Motion.snap(holder, "Size", UDim2.new(1, 0, 0, h))
+            else Motion.to(holder, "Size", UDim2.new(1, 0, 0, h), "smooth") end
+            Motion.to(icon, "Rotation", open and 180 or 0, "snappy")
+        end
+        local function setOpen(next)
+            open = next
+            if open and not built then
+                built = true
+                G.try("toggle.children", spec.children, G.Window.sectionApi(sub))
+            end
+            size()
+        end
+        inner:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() if open then size(true) end end)
+        UI.button(chevron, {
+            hover = function(on) Theme.bind(icon, "ImageColor3", on and "ink" or "faint") end,
+            click = function() UI.sfx("click", 0.5); setOpen(not open) end,
+        })
+        api.open = setOpen
+    end
+    UI.button(row.frame, {
+        hover = row.hover,
+        press = function(on) pressed = on; paint() end,
+        click = function()
+            UI.sfx(value and "toggle_off" or "toggle_on", 0.7)
+            api.set(not value)
+        end,
+        alt = function() contextMenu(track, spec) end,
+    })
+    if spec.tip then UI.tooltip(row.frame, spec.tip) end
+    return api
+end
+
+function Controls.slider(section, spec)
+    local id = spec.id
+    local min, max, step = spec.min or 0, spec.max or 100, spec.step or 1
+    local decimals = spec.decimals or (step < 1 and math.max(0, math.ceil(-math.log10(step))) or 0)
+    local curve = spec.curve or 1
+    local wide = spec.valueWidth or 64
+    local value = id and Config.define(id, spec.default or min) or (spec.default or min)
+    local row = makeRow(section, spec, wide + 12)
+    row.frame.Name = "Slider"
+    local suffix = spec.suffix or ""
+    local function text(v) return (spec.format and spec.format(v)) or (util.format(v, decimals) .. suffix) end
+    local field = UI.new("TextBox", { Name = "Value", Size = UDim2.fromOffset(wide, 24), BackgroundTransparency = 1,
+        Text = text(value), FontFace = G.F.mono400, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
+        ClearTextOnFocus = true, LayoutOrder = 2, Theme = { TextColor3 = "sub" }, PlaceholderText = "", Parent = row.slot })
+    local bar = UI.frame(row.left, { Name = "Bar", Size = UDim2.new(1, 0, 0, 20), LayoutOrder = 5 })
+    row.left.Size = UDim2.new(1, 0, 0, 0)
+    UI.pad(bar, 0, 14, 0, 0)
+    local track = UI.frame(bar, { Name = "Track", Size = UDim2.new(1, 0, 0, 4), Position = UDim2.new(0, 0, 0.5, 0),
+        AnchorPoint = Vector2.new(0, 0.5), Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill3A" } })
+    UI.corner(track, true)
+    local fill = UI.frame(track, { Name = "Fill", Size = UDim2.fromScale(0, 1), Theme = { BackgroundColor3 = "accent" } })
+    UI.corner(fill, true)
+    local knob = UI.frame(track, { Name = "Knob", Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5), BackgroundColor3 = Color3.new(1, 1, 1), ZIndex = 3 })
+    UI.corner(knob, true)
+    if UI.fx.shadow then
+        local shadow = Instance.new("UIShadow")
+        shadow.BlurRadius = UDim.new(0, 6); shadow.Offset = UDim2.fromOffset(0, 1); shadow.Transparency = 0.62
+        shadow.Parent = knob
+    end
+    local dragging = false
+    local function place(instant)
+        local alpha = util.clamp01((value - min) / (max - min)) ^ (1 / curve)
+        if instant then
+            Motion.snap(fill, "Size", UDim2.fromScale(alpha, 1)); Motion.snap(knob, "Position", UDim2.fromScale(alpha, 0.5))
+        else
+            Motion.to(fill, "Size", UDim2.fromScale(alpha, 1), "quick"); Motion.to(knob, "Position", UDim2.fromScale(alpha, 0.5), "quick")
+        end
+        if not field:IsFocused() then field.Text = text(value) end
+    end
+    place(true)
+    local api = { row = row, id = id }
+    function api.get() return value end
+    function api.set(next, quiet)
+        next = math.clamp(util.round(next, step), min, max)
+        if decimals > 0 then next = tonumber(string.format("%." .. decimals .. "f", next)) or next end
+        if next == value then return end
+        if id then Config.set(id, next, quiet) else
+            value = next; place()
+            if spec.changed then G.try("slider", spec.changed, value) end
+        end
+    end
+    if id then
+        Config.on(id, function(next)
+            value = next
+            if track.Parent then place(dragging) end
+            if spec.changed then spec.changed(value) end
+        end)
+        if spec.changed then task.defer(G.safe("slider.init", function() spec.changed(value) end)) end
+    end
+    local hit = UI.new("TextButton", { Name = "Hit", Text = "", BackgroundTransparency = 1, AutoButtonColor = false,
+        Size = UDim2.new(1, 14, 1, 0), Position = UDim2.fromOffset(-7, 0), ZIndex = 6, Parent = bar })
+    local function at(point)
+        local x = track.AbsolutePosition.X
+        local w = math.max(1, track.AbsoluteSize.X)
+        api.set(min + util.clamp01((point.X - x) / w) ^ curve * (max - min))
+    end
+    UI.drag(hit, function(point)
+        dragging = true
+        Motion.to(knob, "Size", UDim2.fromOffset(20, 16), "snappy")
+        at(point)
+    end, function(point) at(point) end, function()
+        dragging = false
+        Motion.to(knob, "Size", UDim2.fromOffset(14, 14), "bouncy")
+        UI.sfx("click", 0.35)
+    end)
+    hit.MouseEnter:Connect(function() if not dragging then Motion.to(knob, "Size", UDim2.fromOffset(16, 16), "quick") end; row.hover(true) end)
+    hit.MouseLeave:Connect(function() if not dragging then Motion.to(knob, "Size", UDim2.fromOffset(14, 14), "quick") end; row.hover(false) end)
+    hit.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then contextMenu(knob, spec) end
+    end)
+    field.FocusLost:Connect(G.safe("slider.field", function()
+        local typed = tonumber((string.gsub(field.Text, "[^%d%.%-]", "")))
+        if typed then api.set(typed) end
+        field.Text = text(value)
+        Theme.bind(field, "TextColor3", "sub")
+    end))
+    field.Focused:Connect(function() Theme.bind(field, "TextColor3", "ink") end)
+    return api
+end
+
+local function optionList(options)
+    local out = {}
+    for _, option in ipairs(options) do
+        if type(option) == "table" then
+            out[#out + 1] = { value = option.value or option[1], label = option.label or option[2] or tostring(option.value or option[1]), icon = option.icon }
+        else
+            out[#out + 1] = { value = option, label = tostring(option) }
+        end
+    end
+    return out
+end
+local function pill(slot, order)
+    local button = UI.pressable(slot, { Name = "Select", Size = UDim2.fromOffset(0, 28), AutomaticSize = Enum.AutomaticSize.X,
+        LayoutOrder = order or 3, Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" } })
+    UI.corner(button, "rSmall")
+    UI.pad(button, 0, 9, 0, 11)
+    UI.list(button, "x", 6, { v = "Center" })
+    local label = UI.text(button, "", "label", "ink", { TextSize = 13, LayoutOrder = 1, TextTruncate = Enum.TextTruncate.AtEnd })
+    local limit = Instance.new("UISizeConstraint"); limit.MaxSize = Vector2.new(132, 28); limit.Parent = label
+    local chevron = UI.icon(button, "chevrons-up-down", 13, "faint", { LayoutOrder = 2 })
+    return button, label, chevron
+end
+
+function Controls.dropdown(section, spec)
+    local id = spec.id
+    local options = optionList(spec.options)
+    local value = id and Config.define(id, spec.default ~= nil and spec.default or options[1].value)
+        or (spec.default ~= nil and spec.default or options[1].value)
+    local row = makeRow(section, spec, 150)
+    local button, label = pill(row.slot)
+    local function labelOf(v)
+        for _, option in ipairs(options) do if option.value == v then return option.label end end
+        return tostring(v)
+    end
+    label.Text = labelOf(value)
+    local api = { row = row, id = id }
+    function api.get() return value end
+    function api.set(next, quiet)
+        if next == value then return end
+        if id then Config.set(id, next, quiet) else
+            value = next; label.Text = labelOf(value)
+            if spec.changed then G.try("dropdown", spec.changed, value) end
+        end
+    end
+    function api.options(list)
+        options = optionList(list)
+        label.Text = labelOf(value)
+    end
+    if id then
+        Config.on(id, function(next)
+            value = next
+            if label.Parent then label.Text = labelOf(value) end
+            if spec.changed then spec.changed(value) end
+        end)
+        if spec.changed then task.defer(G.safe("dropdown.init", function() spec.changed(value) end)) end
+    end
+    local function open()
+        local items = {}
+        for _, option in ipairs(options) do
+            items[#items + 1] = { label = option.label, icon = option.icon, checked = option.value == value,
+                run = function() api.set(option.value) end }
+        end
+        UI.menu(button, items, { align = "right", width = spec.menuWidth })
+    end
+    UI.wire(button, {
+        hover = function(on) Motion.to(button, "BackgroundTransparency", on and T.fill3A or T.fill2A, "quick"); row.hover(on) end,
+        click = function() UI.sfx("click", 0.6); open() end,
+        alt = function() contextMenu(button, spec) end,
+    })
+    return api
+end
+
+function Controls.multi(section, spec)
+    local id = spec.id
+    local options = optionList(spec.options)
+    local value = id and Config.define(id, spec.default or {}) or (spec.default or {})
+    local row = makeRow(section, spec, 150)
+    local button, label = pill(row.slot)
+    local function has(v) return table.find(value, v) ~= nil end
+    local function summary()
+        if #value == 0 then return spec.empty or "None" end
+        if #value == #options then return "All" end
+        if #value <= 2 then
+            local names = {}
+            for _, option in ipairs(options) do if has(option.value) then names[#names + 1] = option.label end end
+            return table.concat(names, ", ")
+        end
+        return #value .. " selected"
+    end
+    label.Text = summary()
+    local api = { row = row, id = id }
+    function api.get() return value end
+    function api.has(v) return has(v) end
+    function api.set(next, quiet)
+        if id then Config.set(id, next, quiet) else
+            value = next; label.Text = summary()
+            if spec.changed then G.try("multi", spec.changed, value) end
+        end
+    end
+    if id then
+        Config.on(id, function(next)
+            value = next
+            if label.Parent then label.Text = summary() end
+            if spec.changed then spec.changed(value) end
+        end)
+        if spec.changed then task.defer(G.safe("multi.init", function() spec.changed(value) end)) end
+    end
+    local function flip(v)
+        local next = table.clone(value)
+        local at = table.find(next, v)
+        if at then table.remove(next, at) else next[#next + 1] = v end
+        local ordered = {}
+        for _, option in ipairs(options) do if table.find(next, option.value) then ordered[#ordered + 1] = option.value end end
+        api.set(ordered)
+    end
+    local function open()
+        UI.popover(button, { width = spec.menuWidth or 212, align = "right" }, function(content)
+            local checks = {}
+            local function refresh()
+                for v, icon in pairs(checks) do icon.ImageTransparency = has(v) and 0 or 1 end
+            end
+            for index, option in ipairs(options) do
+                local item = UI.frame(content, { Size = UDim2.new(1, 0, 0, 32), LayoutOrder = index, Theme = { BackgroundColor3 = "ink" } })
+                UI.corner(item, "rSmall")
+                local x = 10
+                if option.icon then
+                    UI.icon(item, option.icon, 16, "sub", { Position = UDim2.new(0, 10, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5) })
+                    x = 34
+                end
+                UI.text(item, option.label, "label", "ink", { Position = UDim2.new(0, x, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5), TextSize = 13 })
+                local box = UI.frame(item, { Size = UDim2.fromOffset(16, 16), Position = UDim2.new(1, -10, 0.5, 0),
+                    AnchorPoint = Vector2.new(1, 0.5), Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill3A" } })
+                UI.corner(box, 5)
+                checks[option.value] = UI.icon(box, "check", 13, "accent", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+                UI.button(item, {
+                    hover = function(on) Motion.to(item, "BackgroundTransparency", on and T.fill2A or 1, "quick") end,
+                    click = function() UI.sfx("click", 0.6); flip(option.value); refresh() end,
+                })
+            end
+            UI.divider(content, #options + 1)
+            local footer = UI.frame(content, { Size = UDim2.new(1, 0, 0, 30), LayoutOrder = #options + 2 })
+            for index, action in ipairs({
+                { "All", function() local all = {}; for _, o in ipairs(options) do all[#all + 1] = o.value end; api.set(all) end },
+                { "None", function() api.set({}) end },
+            }) do
+                local link = UI.new("TextButton", { Text = action[1], FontFace = G.F.text500, TextSize = 12, BackgroundTransparency = 1,
+                    AutoButtonColor = false, AutomaticSize = Enum.AutomaticSize.XY,
+                    Position = UDim2.new(index == 1 and 0 or 1, index == 1 and 10 or -10, 0.5, 0),
+                    AnchorPoint = Vector2.new(index == 1 and 0 or 1, 0.5), Theme = { TextColor3 = "sub" }, Parent = footer })
+                UI.wire(link, { click = function() UI.sfx("click", 0.5); action[2](); refresh() end,
+                    hover = function(on) Theme.bind(link, "TextColor3", on and "ink" or "sub") end })
+            end
+            refresh()
+        end)
+    end
+    UI.wire(button, {
+        hover = function(on) Motion.to(button, "BackgroundTransparency", on and T.fill3A or T.fill2A, "quick"); row.hover(on) end,
+        click = function() UI.sfx("click", 0.6); open() end,
+        alt = function() contextMenu(button, spec) end,
+    })
+    return api
+end
+
+function Controls.segmentedBar(parent, options, initial, onPick, props)
+    options = optionList(options)
+    local bar = UI.frame(parent, { Name = "Segmented", Size = UDim2.new(1, 0, 0, 30),
+        Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" } })
+    UI.corner(bar, "rSmall")
+    if props then
+        for key, value in pairs(props) do bar[key] = value end
+    end
+    local count = #options
+    local thumb = UI.frame(bar, { Name = "Thumb", Size = UDim2.new(1 / count, -4, 1, -4), Position = UDim2.new(0, 2, 0, 2),
+        Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill3A" } })
+    UI.corner(thumb, "rSmall")
+    local labels = {}
+    local current
+    local edges = Motion.spring(2, "snappy", function(x)
+        local a, b = math.min(x[1], x[2]), math.max(x[1], x[2])
+        thumb.Position = UDim2.new(a, 2, 0, 2)
+        thumb.Size = UDim2.new(b - a, -4, 1, -4)
+    end, 0.0004)
+    local function select(index, instant)
+        local previous = current
+        current = index
+        for i, label in ipairs(labels) do Theme.bind(label, "TextColor3", i == index and "ink" or "sub") end
+        local a, b = (index - 1) / count, index / count
+        if instant or not previous then edges:snap({ a, b }); return end
+        if index > previous then
+            edges.g[2] = b; edges:to({ edges.g[1], b }, "snappy")
+            task.delay(0.045, function() edges:to({ a, b }, "liquid") end)
+        else
+            edges.g[1] = a; edges:to({ a, edges.g[2] }, "snappy")
+            task.delay(0.045, function() edges:to({ a, b }, "liquid") end)
+        end
+    end
+    for index, option in ipairs(options) do
+        local cell = UI.frame(bar, { Size = UDim2.new(1 / count, 0, 1, 0), Position = UDim2.fromScale((index - 1) / count, 0), ZIndex = 2 })
+        labels[index] = UI.text(cell, option.label, "label", "sub", { TextSize = 12.5, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5) })
+        UI.button(cell, { click = function()
+            if current == index then return end
+            UI.sfx("tab", 0.6)
+            select(index)
+            onPick(option.value, index)
+        end })
+    end
+    local startIndex = 1
+    for index, option in ipairs(options) do if option.value == initial then startIndex = index end end
+    select(startIndex, true)
+    return bar, function(v)
+        for index, option in ipairs(options) do if option.value == v then select(index) end end
+    end
+end
+
+function Controls.segmented(section, spec)
+    local id = spec.id
+    local options = optionList(spec.options)
+    local value = id and Config.define(id, spec.default ~= nil and spec.default or options[1].value)
+        or (spec.default ~= nil and spec.default or options[1].value)
+    local width = spec.width or math.min(64 * #options, 220)
+    local row = makeRow(section, spec, width)
+    local holder = UI.frame(row.slot, { Size = UDim2.fromOffset(width, 30), LayoutOrder = 3 })
+    local api = { row = row, id = id }
+    local _, show = Controls.segmentedBar(holder, options, value, function(v)
+        if id then Config.set(id, v) else
+            value = v
+            if spec.changed then G.try("segmented", spec.changed, v) end
+        end
+    end)
+    function api.get() return value end
+    function api.set(v) if id then Config.set(id, v) else value = v; show(v) end end
+    if id then
+        Config.on(id, function(next)
+            value = next
+            if holder.Parent then show(next) end
+            if spec.changed then spec.changed(next) end
+        end)
+        if spec.changed then task.defer(G.safe("segmented.init", function() spec.changed(value) end)) end
+    end
+    return api
+end
+
+function Controls.pillButton(parent, text, style, run, props)
+    local primary, danger = style == "primary", style == "danger"
+    local button = UI.pressable(parent, { Name = "Button", Size = UDim2.fromOffset(0, 28), AutomaticSize = Enum.AutomaticSize.X })
+    local function rest() return primary and 0 or (danger and 0.84 or T.fill2A) end
+    Theme.bind(button, "BackgroundColor3", primary and "accent" or (danger and "bad" or "ink"))
+    button.BackgroundTransparency = rest()
+    if not primary and not danger then Theme.bind(button, "BackgroundTransparency", "fill2A") end
+    UI.corner(button, "rSmall")
+    UI.pad(button, 0, 13)
+    local label = UI.text(button, text, "button", primary and "accentInk" or (danger and "bad" or "ink"),
+        { Size = UDim2.fromScale(0, 1), AutomaticSize = Enum.AutomaticSize.X })
+    local scale = UI.scaleOf(button)
+    if props then
+        for key, value in pairs(props) do button[key] = value end
+    end
+    UI.wire(button, {
+        hover = function(on)
+            local base = rest()
+            Motion.to(button, "BackgroundTransparency", on and (primary and 0.14 or math.max(0, base - 0.06)) or base, "quick")
+        end,
+        press = function(on) Motion.to(scale, "Scale", on and 0.95 or 1, on and "quick" or "bouncy") end,
+        click = function() UI.sfx("click", 0.8); if run then run() end end,
+    })
+    return button, label
+end
+
+function Controls.button(section, spec)
+    local row = makeRow(section, spec, 110)
+    local id = spec.id
+    if id then
+        Config.action(id, function() if spec.run then spec.run() end end)
+        spec.bindable = spec.bindable ~= false
+        if spec.bindable then
+            bindChip(row.slot, id, 1)
+            Controls.bindables[id] = { label = spec.label or id, kind = "button", page = section.page }
+        end
+    end
+    local button, label = Controls.pillButton(row.slot, spec.text or "Run", spec.style, function()
+        if spec.run then G.try("button." .. (spec.label or "?"), spec.run) end
+    end, { LayoutOrder = 3 })
+    button.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton2 and id then
+            contextMenu(button, { id = id, bindable = spec.bindable, label = spec.label, kind = "button" })
+        end
+    end)
+    return { row = row, button = button, setText = function(text) label.Text = text end }
+end
+
+function Controls.keybind(section, spec)
+    local id = spec.id
+    local value = id and Config.define(id, spec.default or "None") or (spec.default or "None")
+    local row = makeRow(section, spec, 100)
+    local chip = UI.pressable(row.slot, { Name = "Key", Size = UDim2.fromOffset(0, 28), AutomaticSize = Enum.AutomaticSize.X,
+        LayoutOrder = 3, Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" } })
+    UI.corner(chip, "rSmall")
+    UI.pad(chip, 0, 11)
+    local floor = Instance.new("UISizeConstraint"); floor.MinSize = Vector2.new(46, 28); floor.Parent = chip
+    local label = UI.text(chip, Config.keyLabel(value ~= "None" and value or nil), "monoBold", "ink",
+        { Size = UDim2.fromScale(1, 1), AutomaticSize = Enum.AutomaticSize.X, TextXAlignment = Enum.TextXAlignment.Center })
+    local stroke = UI.stroke(chip, "accent", 1, 1)
+    local api = { row = row, id = id }
+    function api.get() return value end
+    local function show() label.Text = Config.keyLabel(value ~= "None" and value or nil) end
+    if id then
+        Config.on(id, function(next)
+            value = next
+            if label.Parent then show() end
+            if spec.changed then spec.changed(next) end
+        end)
+        if spec.changed then task.defer(G.safe("keybind.init", function() spec.changed(value) end)) end
+        if spec.onPress then
+            Config.action(id, function()
+                if value and value ~= "None" then spec.onPress() end
+            end)
+        end
+    end
+    UI.wire(chip, {
+        hover = function(on) Motion.to(chip, "BackgroundTransparency", on and T.fill3A or T.fill2A, "quick"); row.hover(on) end,
+        click = function()
+            UI.sfx("click", 0.6)
+            label.Text = "..."
+            Motion.to(stroke, "Transparency", 0, "quick")
+            Config.captureKey(function(key, cancelled, cleared)
+                Motion.to(stroke, "Transparency", 1, "smooth")
+                if not cancelled then
+                    if cleared then
+                        if id then
+                            Config.clearKey(id)
+                        else
+                            value = "None"
+                            if spec.changed then spec.changed(value) end
+                        end
+                    else
+                        local next = key or "None"
+                        if id then
+                            Config.set(id, next)
+                            if spec.onPress then
+                                Config.bind(id, next ~= "None" and next or nil)
+                            end
+                        else
+                            value = next
+                            if spec.changed then spec.changed(next) end
+                        end
+                    end
+                end
+                show()
+            end, 5)
+        end,
+        alt = function() contextMenu(chip, spec) end,
+    })
+    return api
+end
+
+function Controls.field(parent, props, onSubmit)
+    local field = UI.frame(parent, { Name = "Field", Size = UDim2.fromOffset(150, 28),
+        Theme = { BackgroundColor3 = "ink", BackgroundTransparency = "fill2A" }, ZIndex = 10 })
+    UI.corner(field, "rSmall")
+    local stroke = UI.stroke(field, "accent", 1, 1)
+    local box = UI.new("TextBox", { Name = "Box", BackgroundTransparency = 1, Size = UDim2.new(1, -20, 1, 0),
+        Position = UDim2.fromOffset(10, 0), Text = "", FontFace = G.F.text400, TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ClipsDescendants = true,
+        ZIndex = 11, Theme = { TextColor3 = "ink", PlaceholderColor3 = "faint" }, Parent = field })
+    if props then
+        for key, value in pairs(props) do
+            if key == "Width" then field.Size = UDim2.fromOffset(value, 28) else box[key] = value end
+        end
+    end
+    box.Focused:Connect(function() Motion.to(stroke, "Transparency", 0.25, "quick") end)
+    box.FocusLost:Connect(G.safe("field", function(enter)
+        Motion.to(stroke, "Transparency", 1, "smooth")
+        if onSubmit then onSubmit(box.Text, enter) end
+    end))
+    return field, box
+end
+
+function Controls.input(section, spec)
+    local id = spec.id
+    local value = id and Config.define(id, spec.default or "") or (spec.default or "")
+    local row = makeRow(section, spec, spec.width or 150)
+    local api = { row = row, id = id }
+    local _, box = Controls.field(row.slot, { Width = spec.width or 150, PlaceholderText = spec.placeholder or "",
+        Text = tostring(value) }, function(text)
+        if spec.numeric then
+            local n = tonumber(text)
+            if not n then api.box.Text = tostring(value); return end
+            text = n
+        end
+        if id then Config.set(id, text) else
+            value = text
+            if spec.changed then G.try("input", spec.changed, text) end
+        end
+    end)
+    api.box = box
+    function api.get() return value end
+    if id then
+        Config.on(id, function(next)
+            value = next
+            if box.Parent and not box:IsFocused() then box.Text = tostring(next) end
+            if spec.changed then spec.changed(next) end
+        end)
+    end
+    return api
+end
+
+local function hueColor(h) return Color3.fromHSV(h, 1, 1) end
+function Controls.colorPopover(anchor, initial, onChange)
+    local h, s, v = initial:ToHSV()
+    return UI.popover(anchor, { width = 224, align = "right", pad = 10, gap = 10 }, function(content)
+        local square = UI.frame(content, { Name = "SV", Size = UDim2.new(1, 0, 0, 132), BackgroundColor3 = hueColor(h), LayoutOrder = 1 })
+        UI.corner(square, 9)
+        local white = UI.frame(square, { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1) })
+        UI.corner(white, 9)
+        UI.gradient(white, { Transparency = UI.alphaSeq(0, 0, 1, 1) })
+        local black = UI.frame(square, { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(0, 0, 0), ZIndex = 2 })
+        UI.corner(black, 9)
+        UI.gradient(black, { Rotation = 90, Transparency = UI.alphaSeq(0, 1, 1, 0) })
+        local dot = UI.frame(square, { Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0.5, 0.5), ZIndex = 4 })
+        UI.corner(dot, true)
+        local ring = Instance.new("UIStroke"); ring.Color = Color3.new(1, 1, 1); ring.Thickness = 2; ring.Parent = dot
+        local hueBar = UI.frame(content, { Name = "Hue", Size = UDim2.new(1, 0, 0, 12), BackgroundColor3 = Color3.new(1, 1, 1), LayoutOrder = 2 })
+        UI.corner(hueBar, true)
+        local stops = {}
+        for i = 0, 6 do stops[#stops + 1] = ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6 % 1, 1, 1)) end
+        UI.gradient(hueBar, { Color = ColorSequence.new(stops) })
+        local hueKnob = UI.frame(hueBar, { Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = Color3.new(1, 1, 1), ZIndex = 3 })
+        UI.corner(hueKnob, true)
+        local hueRing = Instance.new("UIStroke"); hueRing.Color = Color3.new(0, 0, 0); hueRing.Transparency = 0.7; hueRing.Parent = hueKnob
+        local bottom = UI.frame(content, { Size = UDim2.new(1, 0, 0, 28), LayoutOrder = 3 })
+        local preview = UI.frame(bottom, { Size = UDim2.fromOffset(28, 28), BackgroundColor3 = initial })
+        UI.corner(preview, 8)
+        local hexField, hexBox
+        local function emit(fromHex)
+            local color = Color3.fromHSV(h, s, v)
+            square.BackgroundColor3 = hueColor(h)
+            dot.Position = UDim2.fromScale(s, 1 - v)
+            hueKnob.Position = UDim2.fromScale(h, 0.5)
+            preview.BackgroundColor3 = color
+            if hexBox and not fromHex and not hexBox:IsFocused() then hexBox.Text = "#" .. util.toHex(color) end
+            onChange(color)
+        end
+        hexField, hexBox = Controls.field(bottom, { Width = 96, Text = "#" .. util.toHex(initial),
+            FontFace = G.F.mono400, TextSize = 12 }, function(text)
+            local clean = string.gsub(text, "[^%x]", "")
+            if #clean == 6 then
+                h, s, v = util.hex(clean):ToHSV()
+                emit(true)
+            end
+            hexBox.Text = "#" .. util.toHex(Color3.fromHSV(h, s, v))
+        end)
+        hexField.Position = UDim2.fromOffset(36, 0)
+        local picks = UI.frame(content, { Size = UDim2.new(1, 0, 0, 18), LayoutOrder = 4 })
+        UI.list(picks, "x", 7)
+        for index, accent in ipairs(Theme.accents) do
+            local swatch = UI.frame(picks, { Size = UDim2.fromOffset(18, 18), BackgroundColor3 = accent.color, LayoutOrder = index })
+            UI.corner(swatch, true)
+            UI.button(swatch, { click = function() h, s, v = accent.color:ToHSV(); emit() end })
+        end
+        local svHit = UI.new("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 6, AutoButtonColor = false, Parent = square })
+        local function sv(point)
+            local p, size = square.AbsolutePosition, square.AbsoluteSize
+            s = util.clamp01((point.X - p.X) / size.X)
+            v = 1 - util.clamp01((point.Y - p.Y) / size.Y)
+            emit()
+        end
+        UI.drag(svHit, sv, sv)
+        local hueHit = UI.new("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 12),
+            Position = UDim2.fromOffset(0, -6), ZIndex = 6, AutoButtonColor = false, Parent = hueBar })
+        local function hue(point)
+            h = util.clamp01((point.X - hueBar.AbsolutePosition.X) / hueBar.AbsoluteSize.X)
+            emit()
+        end
+        UI.drag(hueHit, hue, hue)
+        dot.Position = UDim2.fromScale(s, 1 - v)
+        hueKnob.Position = UDim2.fromScale(h, 0.5)
+    end)
+end
+
+function Controls.color(section, spec)
+    local id = spec.id
+    local value = id and Config.define(id, spec.default or Color3.new(1, 1, 1)) or (spec.default or Color3.new(1, 1, 1))
+    local row = makeRow(section, spec, 60)
+    local swatch = UI.frame(row.slot, { Name = "Swatch", Size = UDim2.fromOffset(34, 22), BackgroundColor3 = value, LayoutOrder = 3 })
+    UI.corner(swatch, 7)
+    UI.stroke(swatch, "ink", "stroke2A")
+    local api = { row = row, id = id }
+    function api.get() return value end
+    function api.set(next, quiet)
+        if id then Config.set(id, next, quiet) else
+            value = next; swatch.BackgroundColor3 = next
+            if spec.changed then G.try("color", spec.changed, next) end
+        end
+    end
+    if id then
+        Config.on(id, function(next)
+            value = next
+            if swatch.Parent then swatch.BackgroundColor3 = next end
+            if spec.changed then spec.changed(next) end
+        end)
+        if spec.changed then task.defer(G.safe("color.init", function() spec.changed(value) end)) end
+    end
+    local scale = UI.scaleOf(swatch)
+    UI.button(swatch, {
+        hover = function(on) Motion.to(scale, "Scale", on and 1.08 or 1, "snappy"); row.hover(on) end,
+        click = function() UI.sfx("click", 0.6); Controls.colorPopover(swatch, value, function(color) api.set(color) end) end,
+        alt = function() contextMenu(swatch, spec) end,
+    })
+    return api
+end
+
+function Controls.note(section, spec)
+    section.count = (section.count or 0) + 1
+    local tone = spec.tone or "sub"
+    local box = UI.frame(section.body, { Name = "Note", Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = section.count })
+    UI.pad(box, 10, 14, 12, 14)
+    local inner = UI.frame(box, { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y })
+    UI.list(inner, "x", 9)
+    if spec.icon then UI.icon(inner, spec.icon, 15, tone, { LayoutOrder = 1 }) end
+    local text = UI.text(inner, spec.text or "", "caption", tone, { TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+        LayoutOrder = 2, Size = UDim2.new(1, spec.icon and -24 or 0, 0, 0), LineHeight = 1.2, RichText = spec.rich == true })
+    return { frame = box, set = function(value) text.Text = value end }
+end
+function Controls.custom(section, spec)
+    section.count = (section.count or 0) + 1
+    local frame = UI.frame(section.body, { Name = spec.name or "Custom", Size = UDim2.new(1, 0, 0, spec.height or 100), LayoutOrder = section.count })
+    if spec.height == nil then frame.AutomaticSize = Enum.AutomaticSize.Y end
+    G.try("custom", spec.build, frame)
+    return frame
+end
+end
