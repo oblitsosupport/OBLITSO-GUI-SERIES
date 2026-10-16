@@ -4162,7 +4162,8 @@ end
 do -- 08b_splash.lua
 -- ============================================================================
 --  08b splash   OBL ray loader. Rays from letter tops, glow pads behind
---  shiny letters. Optional subtitle under the word.
+--  shiny letters. GlowPad reference is stored on the letters table, not on
+--  the holder Frame (Instances can't accept arbitrary properties).
 -- ============================================================================
 local S, util, Motion, Theme, T, UI = G.S, G.util, G.Motion, G.Theme, G.T, G.UI
 
@@ -4211,6 +4212,8 @@ function Splash.show()
         local holder = UI.frame(word, { Name = "L" .. i, Size = UDim2.fromOffset(LETTER_W, LETTER_H),
             BackgroundTransparency = 1, LayoutOrder = i, ClipsDescendants = false })
 
+        local entry = { holder = holder, shiny = shiny }
+
         if shiny then
             local pad = UI.frame(holder, { Name = "GlowPad",
                 AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
@@ -4219,7 +4222,7 @@ function Splash.show()
             UI.corner(pad, true)
             UI.gradient(pad, { Rotation = 90, Transparency = UI.alphaSeq(
                 0, 1, 0.35, 0.55, 0.7, 0.75, 1, 1) })
-            holder.GlowPad = pad
+            entry.pad = pad
 
             for _, dir in ipairs({ -1, 1 }) do
                 local ray = UI.frame(holder, { Name = "Ray",
@@ -4240,8 +4243,9 @@ function Splash.show()
             TextColor3 = shiny and SHINE or BASE, TextTransparency = 1, ZIndex = 2,
             TextXAlignment = Enum.TextXAlignment.Center,
             TextYAlignment = Enum.TextYAlignment.Center, Parent = holder })
+        entry.label = label
 
-        letters[i] = { label = label, holder = holder, shiny = shiny }
+        letters[i] = entry
     end
 
     local sub
@@ -4271,8 +4275,8 @@ function Splash.show()
         if Splash.finished then return end
         for _, entry in ipairs(letters) do
             if entry.shiny then
-                if entry.holder.GlowPad then
-                    TS:Create(entry.holder.GlowPad, TweenInfo.new(0.5, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.72 }):Play()
+                if entry.pad then
+                    TS:Create(entry.pad, TweenInfo.new(0.5, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.72 }):Play()
                 end
                 for _, ray in ipairs(rayChildren(entry.holder)) do
                     TS:Create(ray, TweenInfo.new(0.5, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.5 }):Play()
@@ -4287,14 +4291,14 @@ function Splash.show()
             for _, entry in ipairs(letters) do
                 if entry.shiny and entry.label.Parent then
                     TS:Create(entry.label, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { TextColor3 = SHINE_HOT }):Play()
-                    if entry.holder.GlowPad then
-                        TS:Create(entry.holder.GlowPad, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.55 }):Play()
+                    if entry.pad then
+                        TS:Create(entry.pad, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.55 }):Play()
                     end
                     task.delay(0.35, function()
                         if entry.label.Parent and not Splash.finished then
                             TS:Create(entry.label, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { TextColor3 = SHINE }):Play()
-                            if entry.holder.GlowPad then
-                                TS:Create(entry.holder.GlowPad, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.72 }):Play()
+                            if entry.pad then
+                                TS:Create(entry.pad, TweenInfo.new(0.35, Enum.EasingStyle.Sine), { BackgroundTransparency = 0.72 }):Play()
                             end
                         end
                     end)
