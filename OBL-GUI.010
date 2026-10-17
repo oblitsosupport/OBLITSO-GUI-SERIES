@@ -2850,7 +2850,6 @@ function Config.keyDown(key)
     return ok and code ~= nil and UIS:IsKeyDown(code)
 end
 end
-
 do -- 06_controls.lua
 -- ============================================================================
 --  06 controls  rows, right-click menu, danger flags
